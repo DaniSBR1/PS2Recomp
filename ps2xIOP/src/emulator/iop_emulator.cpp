@@ -455,7 +455,16 @@ namespace ps2x::iop::detail
                 cpu.gpr[29] = kCallStackBase - 32u;
             }
             cpu.gpr[31] = kCallReturnSentinel;
-            runCpu(cpu, budget);
+            const uint32_t used = runCpu(cpu, budget);
+            if (cpu.pc != kCallReturnSentinel)
+            {
+                // The caller gets whatever $v0 held mid-function: make that visible instead of silent.
+                std::ostringstream out;
+                out << "[IOP] call to 0x" << std::hex << address << " did not return (pc=0x" << cpu.pc
+                    << " ra=0x" << cpu.gpr[31] << (cpu.yielded ? " yielded" : "") << (cpu.stopped ? " stopped" : "")
+                    << ") after " << std::dec << used << " instructions";
+                log(LogLevel::Warning, out.str());
+            }
             return cpu.gpr[2];
         }
 

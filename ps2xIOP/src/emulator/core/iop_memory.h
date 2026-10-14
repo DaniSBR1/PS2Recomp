@@ -22,7 +22,10 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // Was 0x00120000: that reserved ~1 MB for module images (God of War's 8 IRX use ~300 KB) and left
+        // only 832 KB of heap, while SMPD_IOP.IRX alone asks AllocSysMemory for 1.1 MB. On hardware,
+        // modules and heap share the 2 MB through sysmem.
+        static constexpr uint32_t HeapBase = 0x00070000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
