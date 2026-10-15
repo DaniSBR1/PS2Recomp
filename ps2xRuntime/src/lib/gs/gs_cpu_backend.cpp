@@ -877,7 +877,15 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    // TEST.ZTE = 0 disables the depth test and the depth write (PCSX2: the draw
+    // is only skipped for ZTE = 1 with ZTST = NEVER; ZTE = 0 masks Z).
+    const bool depthTestEnabled = ((ctx.test >> 16) & 1u) != 0u;
+    // The incoming Z saturates to the depth buffer format (PCSX2 clamps it too).
+    if (zpsm == GS_PSM_Z24)
+        z = static_cast<int>(std::min<uint32_t>(static_cast<uint32_t>(z), 0xFFFFFFu));
+    else if (zpsm == GS_PSM_Z16 || zpsm == GS_PSM_Z16S)
+        z = static_cast<int>(std::min<uint32_t>(static_cast<uint32_t>(z), 0xFFFFu));
+    const uint32_t ztestMethod = depthTestEnabled ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
     const bool alphaBlendEnabled = state.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
@@ -1006,7 +1014,7 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
     }
 
-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
+    if (writeMask.writeDepth && !ctx.zbuf.zmask && depthTestEnabled)
     {
         WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
     }
