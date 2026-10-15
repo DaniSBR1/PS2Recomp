@@ -53,12 +53,11 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // No infinities on the EE FPU: x/0 gives +/-FLT_MAX and sets D or I in FCR31 (SotC fork 8b51cb9, via KIexster/god-of-war-recomp).
+                return fmt::format("ctx->f[{}] = ps2FpuDivide(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // R5900 SQRT.S takes its operand from FT, not FS (PCSX2 FPU.cpp; via KIexster/god-of-war-recomp).
+                return fmt::format("ctx->f[{}] = ps2FpuSqrt(ctx->fcr31, ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -76,7 +75,8 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // R5900 RSQRT.S computes FS/sqrt(FT), not 1/sqrt(FS) (PCSX2 FPU.cpp; via KIexster/god-of-war-recomp).
+                return fmt::format("ctx->f[{}] = ps2FpuRsqrt(ctx->fcr31, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

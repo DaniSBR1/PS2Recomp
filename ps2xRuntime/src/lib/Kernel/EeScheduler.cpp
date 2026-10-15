@@ -297,12 +297,15 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            loadSharedVu0Random(context);
             function(m_rdram, &context, &m_runtime);
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -2131,6 +2134,24 @@ void EeScheduler::copyMainContextToRuntime()
     {
         m_runtime.m_cpuContext = main->context;
     }
+}
+
+// The VU0 R register (random number LFSR) is one piece of hardware shared by every EE thread,
+// not per-thread state (SotC fork e36fbf1, via KIexster/god-of-war-recomp).
+void EeScheduler::loadSharedVu0Random(R5900Context &context)
+{
+    if (!m_sharedVu0RandomValid)
+    {
+        saveSharedVu0Random(context);
+        return;
+    }
+    context.vu0_r = m_sharedVu0Random;
+}
+
+void EeScheduler::saveSharedVu0Random(const R5900Context &context)
+{
+    m_sharedVu0Random = context.vu0_r;
+    m_sharedVu0RandomValid = true;
 }
 
 void EeScheduler::publishDebugContext(const R5900Context &context)

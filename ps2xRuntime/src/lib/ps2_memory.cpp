@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -1353,7 +1354,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Long chains (over 4096 tags) were cut short and left the GIF in IMAGE mode
+                    // (SotC fork e36fbf1, via KIexster/god-of-war-recomp).
+                    const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1530,6 +1533,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                     }
 
+                    if (tagsProcessed >= kMaxChainTags)
+                    {
+                        std::fprintf(stderr, "[dma] chain on 0x%08x stopped after %d tags at 0x%08x\n", channelBase, tagsProcessed, tagAddr);
+                        std::fflush(stderr);
+                    }
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;

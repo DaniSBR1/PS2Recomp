@@ -108,6 +108,9 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
+    // Counts dispatched jumps (not calls) to tell an implicit return from a tail jump
+    // back to the callee's entry (SotC fork c4c20e8, via KIexster/god-of-war-recomp).
+    thread_local uint64_t g_guestJumpSerial = 0u;
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -1356,13 +1359,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    if (m_eeScheduler && eeCheckpointDue(EeScheduler::kGuestDispatchCycles))
     {
         return false;
     }
 
     if (!isCall)
     {
+        ++g_guestJumpSerial;
         if (!hasFunction(targetPc))
         {
             reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
@@ -1396,6 +1400,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t checkpointSerial = m_eeCheckpointSerial;
+    const uint64_t jumpSerial = g_guestJumpSerial;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1403,7 +1409,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (ctx->pc == entryPc)
+    // pc == entryPc only means "implicit return" when the callee neither yielded at a
+    // checkpoint (it is then parked at its own entry and must resume there) nor dispatched
+    // a tail jump back to its entry. Treating those cases as a return skipped the rest of
+    // the callee (God of War: a half-copied "Animation" string, then a NULL state).
+    // From KIexster/god-of-war-recomp (checkpoint patch) and the SotC fork (c4c20e8).
+    if (ctx->pc == entryPc && m_eeCheckpointSerial == checkpointSerial && jumpSerial == g_guestJumpSerial)
     {
         ctx->pc = fallthroughPc;
     }
@@ -2221,7 +2232,10 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+        ++m_eeCheckpointSerial;
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
