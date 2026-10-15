@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <optional>
 #include <span>
@@ -110,6 +111,8 @@ namespace ps2x::iop::detail
               imports(memory),
               loadcore(memory, imports)
         {
+            kernel.setSyncWaitPump([this](const std::function<bool()> &ready)
+                                   { pumpThreadsUntil(ready); });
             reset();
         }
 
@@ -562,6 +565,53 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // A WaitSema/WaitEventFlag issued by a synchronous call (an RPC handler or a callback run with
+        // callFunction) has no thread to block. On the real IOP the RPC server thread would sleep while
+        // the thread that produces the data runs. Do the same here: run the ready threads until the
+        // condition holds, for at most kSyncWaitBudgetCycles. Without this, handlers that wait for a
+        // worker thread (e.g. a disc read) carry on with stale data.
+        void pumpThreadsUntil(const std::function<bool()> &ready)
+        {
+            if (pumpingSyncWait)
+                return;
+            pumpingSyncWait = true;
+            const uint64_t limit = totalCycles + kSyncWaitBudgetCycles;
+            try
+            {
+                while (!ready() && totalCycles < limit)
+                {
+                    servicePendingDmaInterrupts();
+                    servicePendingGuestCallbacks();
+                    timrman.serviceDue(totalCycles, *this);
+                    IopThread *next = kernel.beginNextReady(totalCycles);
+                    if (!next)
+                    {
+                        uint64_t nextWake = kernel.nextWakeCycle(limit);
+                        for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                            nextWake = std::min(nextWake, completionCycle);
+                        if (!pendingGuestCallbacks.empty())
+                            nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                        nextWake = timrman.nextEventCycle(nextWake);
+                        totalCycles = std::max(totalCycles + 1u, std::min(limit, nextWake));
+                        continue;
+                    }
+                    const uint64_t before = totalCycles;
+                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, limit - totalCycles)));
+                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+                    if (totalCycles == before)
+                        ++totalCycles;
+                }
+            }
+            catch (...)
+            {
+                pumpingSyncWait = false;
+                throw;
+            }
+            pumpingSyncWait = false;
+            if (!ready())
+                log(LogLevel::Warning, "[IOP] synchronous wait timed out: no thread signalled it");
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -715,6 +765,7 @@ namespace ps2x::iop::detail
         std::string lastError;
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
+        bool pumpingSyncWait = false;
         uint32_t callDepth = 0u;
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;

@@ -415,6 +415,22 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
                 setV0(0);
             }
+            else if (m_syncWaitPump)
+            {
+                // No thread to block: let the thread that will signal the semaphore run first.
+                m_syncWaitPump([this, id]
+                               {
+                                   const auto semaphore = m_semaphores.find(id);
+                                   return semaphore == m_semaphores.end() || semaphore->second.current > 0; });
+                const auto semaphore = m_semaphores.find(id);
+                if (semaphore != m_semaphores.end() && semaphore->second.current > 0)
+                {
+                    --semaphore->second.current;
+                    setV0(0);
+                }
+                else
+                    setV0(-419);
+            }
             return true;
         }
         case 11:
@@ -616,6 +632,26 @@ namespace ps2x::iop::detail
                 m_currentThread->waitResultAddress = cpu.gpr[7];
                 setV0(0);
                 cpu.yielded = true;
+            }
+            else if (m_syncWaitPump)
+            {
+                // No thread to block: let the thread that will set the flag run first.
+                const int eventId = event->second.id;
+                m_syncWaitPump([this, eventId, bits, mode]
+                               {
+                                   const auto flag = m_eventFlags.find(eventId);
+                                   return flag == m_eventFlags.end() || eventSatisfied(flag->second, bits, mode); });
+                const auto flag = m_eventFlags.find(eventId);
+                if (flag != m_eventFlags.end() && eventSatisfied(flag->second, bits, mode))
+                {
+                    if (cpu.gpr[7] != 0u)
+                        m_memory.write32(cpu.gpr[7], flag->second.bits);
+                    if ((mode & 0x10u) != 0u)
+                        flag->second.bits = 0u;
+                    setV0(0);
+                }
+                else
+                    setV0(-418);
             }
             else
                 setV0(-418);

@@ -111,6 +111,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_gsIrqSeenEvents = 0u;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -1746,6 +1747,7 @@ void EeScheduler::processPendingEvents()
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
+    pollGsInterrupt();
     for (uint32_t timer = 0u; timer < 4u; ++timer)
     {
         if ((timerInterrupts & (1u << timer)) != 0u)
@@ -1771,6 +1773,24 @@ void EeScheduler::processPendingEvents()
         m_checkpointPending.store(pendingWork, std::memory_order_release);
     }
     applyPendingPreemption();
+}
+
+// The GS raises INTC cause 0 when a GIF packet writes SIGNAL or FINISH (CSR bits 0/1) and the event is
+// not masked in IMR (SIGMSK = bit 8, FINISHMSK = bit 9). Games use it to know when the GS has finished
+// a batch (e.g. a handler that checks CSR.FINISH and releases a busy-wait). The GS front end only sets
+// the CSR bits, so deliver the interrupt here, once per event: the bits stay set until the game clears
+// them (write 1 to CSR), which re-arms them.
+void EeScheduler::pollGsInterrupt()
+{
+    GSRegisters &gs = m_runtime.memory().gs();
+    const uint32_t events = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+    const uint32_t masked = static_cast<uint32_t>(gs.imr >> 8) & 0x3u;
+    const uint32_t raised = events & ~masked & ~m_gsIrqSeenEvents;
+    m_gsIrqSeenEvents = events;
+    if (raised != 0u)
+    {
+        dispatchIrq(false, 0u);
+    }
 }
 
 void EeScheduler::processDueDeadlines()

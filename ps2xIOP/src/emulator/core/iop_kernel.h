@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 
 namespace ps2x::iop::detail
@@ -47,6 +48,12 @@ namespace ps2x::iop::detail
     {
     public:
         explicit IopKernel(IopMemory &memory) noexcept;
+
+        // Runs other IOP threads until ready() holds (or a time budget runs out). The emulator installs
+        // it so that a WaitSema/WaitEventFlag issued outside any thread (an RPC handler or a callback run
+        // as a synchronous call) waits for the thread that will signal it, as on the real IOP.
+        using SyncWaitPump = std::function<void(const std::function<bool()> &ready)>;
+        void setSyncWaitPump(SyncWaitPump pump) { m_syncWaitPump = std::move(pump); }
 
         void reset();
 
@@ -99,5 +106,6 @@ namespace ps2x::iop::detail
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
         IopThread *m_currentThread = nullptr;
+        SyncWaitPump m_syncWaitPump;
     };
 }

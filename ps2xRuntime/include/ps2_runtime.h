@@ -384,6 +384,9 @@ public:
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+    // Keeps the stacks handed to interrupt handlers and callbacks below a guest stack (the main
+    // thread's, from SetupThread), so they never overlap it.
+    void keepAsyncCallbackStacksBelow(uint32_t address);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 

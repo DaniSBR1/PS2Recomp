@@ -531,6 +531,12 @@ namespace ps2_syscalls
         }
 
         scheduler.setupCurrentThread(initialStack, stackSize, getRegU32(ctx, 28));
+        // The main stack often sits at the top of RAM, where the runtime takes the stacks for interrupt
+        // handlers and callbacks: a handler would overwrite the main thread's frames.
+        if (stackSize != 0u && sp > stackSize)
+        {
+            runtime->keepAsyncCallbackStacksBelow(sp - stackSize);
+        }
         setReturnU32(ctx, sp);
     }
 

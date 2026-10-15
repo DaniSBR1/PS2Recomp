@@ -384,6 +384,7 @@ private:
     void applyPendingPreemption();
     void processPendingEvents();
     void processDueDeadlines();
+    void pollGsInterrupt();
     void processEvent(const EeEvent &event);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
     [[nodiscard]] static bool eventCondition(uint32_t current, uint32_t requested, uint32_t mode);
@@ -425,6 +426,7 @@ private:
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
+    uint32_t m_gsIrqSeenEvents = 0; // CSR SIGNAL/FINISH bits already turned into an INTC 0
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};

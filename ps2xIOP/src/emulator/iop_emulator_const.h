@@ -13,5 +13,7 @@ constexpr uint32_t kDefaultSlice = 256u;
 // Was 2'000'000 (~54 ms of real IOP time): legitimate RPC handlers take longer (989snd's external
 // command 104 + SMPD_IOP registers ~150 named entries) and were cut off mid-way, returning garbage.
 constexpr uint32_t kMaxCallInstructions = 100'000'000u;
+// Longest a synchronous call may wait for an IOP thread to signal a semaphore or event flag (1 s).
+constexpr uint64_t kSyncWaitBudgetCycles = kIopClockHz;
 constexpr uint32_t kModuleLoadBase = 0x00010000u;
 constexpr uint32_t kStackGuardBytes = 64u;
