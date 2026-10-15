@@ -607,6 +607,20 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         ++srcIndex;
                         decoded = true;
                     }
+                    else if (!sourceAvailable &&
+                             pos + (srcIndex + 1u) * bytesPerVector <= sizeBytes)
+                    {
+                        // Fill cycles (CL < WL) unpack the next vector without
+                        // advancing the source; mask and mode apply as usual
+                        // (PCSX2 _nVifUnpackLoop).
+                        srcVec = srcBase + srcIndex * bytesPerVector;
+                        decoded = true;
+                    }
+                    // V3 unpacks run the V4 logic: w takes the next element of
+                    // the stream (PCSX2 UNPACK_V4, confirmed hardware behaviour).
+                    const bool v3NextAvailable =
+                        decoded && components == 3 &&
+                        static_cast<uint32_t>(srcVec - data) + bytesPerVector + bytesPerVector / 3u <= sizeBytes;
 
                     auto extend16 = [&](uint16_t raw) -> uint32_t
                     {
@@ -647,6 +661,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                 std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
                                 decompressed[c] = scalar;
                             }
+                            if (v3NextAvailable)
+                                std::memcpy(&decompressed[3], srcVec + 12u, sizeof(uint32_t));
                         }
                     }
                     else if (vl == 1u)
@@ -670,6 +686,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                 std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
                                 decompressed[c] = extend16(raw);
                             }
+                            if (v3NextAvailable)
+                            {
+                                uint16_t raw = 0;
+                                std::memcpy(&raw, srcVec + 6u, sizeof(raw));
+                                decompressed[3] = extend16(raw);
+                            }
                         }
                     }
                     else if (vl == 2u)
@@ -689,6 +711,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             {
                                 decompressed[c] = extend8(srcVec[c]);
                             }
+                            if (v3NextAvailable)
+                                decompressed[3] = extend8(srcVec[3]);
                         }
                     }
                     else if (vl == 3u && vn == 3u)
@@ -696,14 +720,22 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         // V4-5: packed color-like format in a single 16-bit value.
                         uint16_t packed = 0;
                         std::memcpy(&packed, srcVec, sizeof(packed));
-                        decompressed[0] = packed & 0x1Fu;
-                        decompressed[1] = (packed >> 5) & 0x1Fu;
-                        decompressed[2] = (packed >> 10) & 0x1Fu;
-                        decompressed[3] = (packed >> 15) & 0x01u;
+                        // 5:5:5:1 expanded to 8 bits per channel (PCSX2 UNPACK_V4_5).
+                        decompressed[0] = (packed & 0x001Fu) << 3;
+                        decompressed[1] = (packed & 0x03E0u) >> 2;
+                        decompressed[2] = (packed & 0x7C00u) >> 7;
+                        decompressed[3] = (packed & 0x8000u) >> 8;
                     }
                     else
                     {
                         handledFormat = false;
+                    }
+
+                    // V2 writes x, y, x, y (PCSX2 UNPACK_V2: the PS2 really does this).
+                    if (decoded && components == 2 && handledFormat)
+                    {
+                        decompressed[2] = decompressed[0];
+                        decompressed[3] = decompressed[1];
                     }
 
                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
@@ -743,6 +775,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                     writeVal = writeVal + vif1_regs.row[field];
                                     if (mode == 2u)
                                         vif1_regs.row[field] = writeVal;
+                                }
+                                else if (canAdd && mode == 3u)
+                                {
+                                    vif1_regs.row[field] = writeVal; // PCSX2 writeXYZW mode 3
                                 }
                             }
                         }

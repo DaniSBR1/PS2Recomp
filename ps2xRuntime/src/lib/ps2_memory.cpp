@@ -201,13 +201,22 @@ namespace
         uint32_t upper = 0;
     };
 
+    // DMA addresses with bit 31 (SPR) set select the scratchpad (PCSX2 dmaGetAddr):
+    // map them to the 0x70000000 window the rest of the memory code understands.
+    inline uint32_t resolveDmaAddress(uint32_t addr)
+    {
+        if ((addr & 0x80000000u) != 0u)
+            return PS2_SCRATCHPAD_BASE | (addr & (PS2_SCRATCHPAD_SIZE - 16u));
+        return addr;
+    }
+
     inline DmaTagView decodeDmaTag(uint64_t tag)
     {
         DmaTagView out{};
         out.qwc = static_cast<uint16_t>(tag & 0xFFFFu);
         out.id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
         out.irq = ((tag >> 31u) & 0x1ull) != 0ull;
-        out.addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
+        out.addr = resolveDmaAddress(static_cast<uint32_t>(tag >> 32u));
         out.upper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
         return out;
     }
@@ -1302,7 +1311,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             }
 
             const uint32_t channelBase = address & 0xFFFFFF00;
-            const uint32_t madr = m_ioRegisters[channelBase + 0x10];
+            const uint32_t madr = resolveDmaAddress(m_ioRegisters[channelBase + 0x10]);
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
@@ -1339,7 +1348,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
                 else if (mode == 1)
                 {
-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    uint32_t tagAddr = resolveDmaAddress(m_ioRegisters[channelBase + 0x30]);
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
@@ -1438,7 +1447,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        uint32_t addr = resolveDmaAddress(static_cast<uint32_t>(tag >> 32));
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 
@@ -1592,6 +1601,113 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         return false;
 
     const uint32_t mode = (chcr >> 2u) & 0x3u;
+    const bool fromSpr = channelBase == kSprFromChannel;
+
+    // Copies qwc quadwords between main RAM (DMA address, SPR bit honoured) and the
+    // scratchpad at sadr, wrapping inside the 16 KB scratchpad. Returns false when
+    // the RAM side is out of range.
+    const auto copyBlock = [&](uint32_t dmaAddr, uint32_t &sadr, uint32_t qwcount) -> bool
+    {
+        const uint32_t ramAddr = resolveDmaAddress(dmaAddr);
+        if (isScratchpad(ramAddr))
+            return false;
+        uint32_t ramOffset = 0u;
+        try
+        {
+            ramOffset = translateAddress(ramAddr & ~0xFu);
+        }
+        catch (const std::exception &)
+        {
+            return false;
+        }
+        const uint32_t bytes = qwcount * 16u;
+        if (ramOffset > PS2_RAM_SIZE || bytes > PS2_RAM_SIZE - ramOffset)
+            return false;
+        uint32_t done = 0u;
+        while (done < bytes)
+        {
+            const uint32_t chunk = std::min(bytes - done, PS2_SCRATCHPAD_SIZE - sadr);
+            if (fromSpr)
+            {
+                std::memcpy(m_rdram + ramOffset + done, m_scratchpad + sadr, chunk);
+                markModified(ramOffset + done, chunk);
+            }
+            else
+            {
+                std::memcpy(m_scratchpad + sadr, m_rdram + ramOffset + done, chunk);
+            }
+            done += chunk;
+            sadr = (sadr + chunk) & (PS2_SCRATCHPAD_SIZE - 16u);
+        }
+        return true;
+    };
+
+    if (mode == 1u && fromSpr)
+    {
+        // fromSPR destination chain (PCSX2 _dmaSPR0): the DMAtags live in the
+        // scratchpad; each one gives QWC and the RAM destination of the
+        // quadwords that follow it. CNTS = 0, CNT = 1, END = 7.
+        uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+        uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+        uint32_t qwcLeft = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+        const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+        bool done = false;
+        if (qwcLeft != 0u)
+        {
+            copyBlock(madr, sadr, qwcLeft);
+            madr += qwcLeft * 16u;
+            done = ((chcr >> 28u) & 0x7u) == 7u;
+        }
+        uint32_t tagUpper = chcr >> 16u;
+        for (int tags = 0; !done && tags < 4096; ++tags)
+        {
+            uint64_t tag = 0;
+            std::memcpy(&tag, m_scratchpad + sadr, sizeof(tag));
+            sadr = (sadr + 16u) & 0x3FF0u;
+            const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
+            const uint32_t id = static_cast<uint32_t>((tag >> 28u) & 0x7u);
+            const bool irq = ((tag >> 31u) & 1ull) != 0ull;
+            madr = static_cast<uint32_t>(tag >> 32u);
+            tagUpper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
+            if (tagQwc != 0u)
+                copyBlock(madr, sadr, tagQwc);
+            madr += tagQwc * 16u;
+            done = (id == 7u) || (id != 0u && id != 1u) || (tieEnabled && irq);
+        }
+        m_ioRegisters[channelBase + 0x00u] = (chcr & 0x0000FFFFu) | (tagUpper << 16u);
+        m_ioRegisters[channelBase + 0x10u] = madr;
+        m_ioRegisters[channelBase + 0x20u] = 0u;
+        m_ioRegisters[channelBase + 0x80u] = sadr;
+        completeDmacChannel(channelBase, 8u);
+        return true;
+    }
+
+    if (mode == 2u)
+    {
+        // Interleave (PCSX2 _SPR0interleave/_SPR1interleave): TQWC quadwords are
+        // transferred, then SQWC quadwords are skipped on the RAM side.
+        const uint32_t sqwcReg = m_ioRegisters.count(0x1000E030u) ? m_ioRegisters[0x1000E030u] : 0u;
+        const uint32_t skipQwc = sqwcReg & 0xFFu;
+        uint32_t transferQwc = (sqwcReg >> 16u) & 0xFFu;
+        uint32_t qwcLeft = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+        if (transferQwc == 0u)
+            transferQwc = qwcLeft;
+        uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+        uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+        while (qwcLeft != 0u && transferQwc != 0u)
+        {
+            const uint32_t n = std::min(transferQwc, qwcLeft);
+            copyBlock(madr, sadr, n);
+            madr += (skipQwc + n) * 16u;
+            qwcLeft -= n;
+        }
+        m_ioRegisters[channelBase + 0x10u] = madr;
+        m_ioRegisters[channelBase + 0x20u] = 0u;
+        m_ioRegisters[channelBase + 0x80u] = sadr;
+        completeDmacChannel(channelBase, fromSpr ? 8u : 9u);
+        return true;
+    }
+
     if (mode != 0u)
         return false;
 
