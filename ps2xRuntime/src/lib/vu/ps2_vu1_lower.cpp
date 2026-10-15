@@ -16,7 +16,8 @@ namespace
             0.999999344348907f,
             -0.333298563957214f,
             0.199465364217758f,
-            -0.13085337519646f,
+            // The t^7 coefficient is -0.139085..., as in PCSX2 (was -0.130853..., a typo; via KIexster/god-of-war-recomp).
+            -0.139085337519646f,
             0.096420042216778f,
             -0.055909886956215f,
             0.021861229091883f,
@@ -726,7 +727,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 queueP(sum, 12u);
                 return;
             }
-            case 0x77: // ERSQRT
+            // EFU opcodes from the PCSX2 LowerOP table
+            // 32ac6e23e4aaf8c8c5e74a6c1ed750ee7672120e; 0x77 is reserved (via KIexster/god-of-war-recomp).
+            case 0x79: // ERSQRT
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -747,7 +750,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
                 return;
             }
-            case 0x79: // ESIN
+            case 0x7C: // ESIN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 const float value = normalizeOperand(m_state.vf[vfS][component]);
@@ -763,13 +766,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             }
             case 0x7B: // WAITP
                 return;
-            case 0x7C: // EATAN
+            case 0x7D: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
                 return;
             }
-            case 0x7D: // EEXP
+            case 0x7E: // EEXP
             {
                 const uint32_t component = (instr >> 21) & 3u;
                 queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
