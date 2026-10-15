@@ -9,11 +9,20 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <immintrin.h>
+#define PS2X_GS_CPU_PAUSE() _mm_pause()
+#else
+#define PS2X_GS_CPU_PAUSE() std::this_thread::yield()
+#endif
 
 using namespace GSInternal;
 
@@ -296,7 +305,15 @@ namespace
     {
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        const float value = top + (bottom - top) * fy;
+        // Same result as clampU8(lround(value)) without the libm call: lround rounds halfway
+        // cases away from zero, and value - trunc(value) is exact for |value| < 2^23.
+        if (!(value > 0.0f))
+            return 0u;
+        if (value >= 255.0f)
+            return 255u;
+        const int whole = static_cast<int>(value);
+        return static_cast<uint8_t>(whole + ((value - static_cast<float>(whole)) >= 0.5f ? 1 : 0));
     }
 }
 
@@ -441,6 +458,155 @@ namespace
         return count;
     }
 }
+
+// Raster worker pool: large primitives are split by rows across these threads. Rows of one
+// primitive never touch the same pixel (framebuffer or Z), and every pixel goes through exactly
+// the same arithmetic as on one thread, so the output does not change. The only per-thread state
+// is the texture page cache, which each thread invalidates when a primitive starts.
+// PS2X_GS_THREADS=N sets the number of workers (0 disables the pool).
+class GSRasterWorkerPool
+{
+public:
+    using RowThunk = void (*)(void *context, int firstRow, int lastRow, GSMem::TexturePageCache &cache);
+
+    explicit GSRasterWorkerPool(unsigned workerCount)
+        : m_caches(workerCount + 1u)
+    {
+        for (auto &cache : m_caches)
+            cache = std::make_unique<GSMem::TexturePageCache>();
+        m_threads.reserve(workerCount);
+        for (unsigned i = 0; i < workerCount; ++i)
+            m_threads.emplace_back([this, i]
+                                   { WorkerMain(i); });
+    }
+
+    ~GSRasterWorkerPool()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+            m_generation.fetch_add(1u, std::memory_order_release);
+        }
+        m_wake.notify_all();
+        for (auto &thread : m_threads)
+            thread.join();
+    }
+
+    static unsigned DefaultWorkerCount()
+    {
+        if (const char *env = std::getenv("PS2X_GS_THREADS"))
+            return static_cast<unsigned>(std::clamp(std::atoi(env), 0, 32));
+        const unsigned hardware = std::thread::hardware_concurrency();
+        // Leave room for the guest thread (which also rasterizes) and the presentation thread.
+        return hardware > 2u ? std::min(hardware - 2u, 8u) : 0u;
+    }
+
+    void Run(int firstRow, int lastRow, RowThunk thunk, void *context)
+    {
+        for (auto &cache : m_caches)
+            cache->Invalidate();
+        m_thunk = thunk;
+        m_context = context;
+        m_lastRow = lastRow;
+        m_nextRow.store(firstRow, std::memory_order_relaxed);
+        m_pending.store(static_cast<unsigned>(m_threads.size()), std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_generation.fetch_add(1u, std::memory_order_release);
+        }
+        m_wake.notify_all();
+
+        Work(*m_caches.back());
+        while (m_pending.load(std::memory_order_acquire) != 0u)
+            PS2X_GS_CPU_PAUSE();
+    }
+
+private:
+    static constexpr int kRowsPerChunk = 4;
+    static constexpr int kSpinIterations = 4000;
+
+    void Work(GSMem::TexturePageCache &cache)
+    {
+        for (;;)
+        {
+            const int first = m_nextRow.fetch_add(kRowsPerChunk, std::memory_order_relaxed);
+            if (first > m_lastRow)
+                return;
+            m_thunk(m_context, first, std::min(first + kRowsPerChunk - 1, m_lastRow), cache);
+        }
+    }
+
+    void WorkerMain(unsigned index)
+    {
+        uint64_t seen = 0;
+        for (;;)
+        {
+            // Primitives come in bursts: spin briefly before sleeping to keep wake-up latency low.
+            uint64_t generation = m_generation.load(std::memory_order_acquire);
+            for (int spin = 0; generation == seen && spin < kSpinIterations; ++spin)
+            {
+                PS2X_GS_CPU_PAUSE();
+                generation = m_generation.load(std::memory_order_acquire);
+            }
+            if (generation == seen)
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_wake.wait(lock, [&]
+                            { return m_generation.load(std::memory_order_acquire) != seen; });
+                generation = m_generation.load(std::memory_order_acquire);
+            }
+            seen = generation;
+            if (m_stop)
+                return;
+            Work(*m_caches[index]);
+            m_pending.fetch_sub(1u, std::memory_order_release);
+        }
+    }
+
+    std::vector<std::unique_ptr<GSMem::TexturePageCache>> m_caches; // one per worker + caller
+    std::vector<std::thread> m_threads;
+    std::mutex m_mutex;
+    std::condition_variable m_wake;
+    std::atomic<uint64_t> m_generation{0};
+    std::atomic<int> m_nextRow{0};
+    std::atomic<unsigned> m_pending{0};
+    RowThunk m_thunk = nullptr;
+    void *m_context = nullptr;
+    int m_lastRow = 0;
+    bool m_stop = false;
+};
+
+template <typename RowFn>
+void GSCpuBackend::RasterizeRows(int firstRow, int lastRow, int rowWidth, RowFn &&rows)
+{
+    if (lastRow < firstRow)
+        return;
+    // Below this size, waking the workers costs more than it saves.
+    constexpr int kMinParallelPixels = 2048;
+    constexpr int kMinParallelRows = 8;
+    const int rowCount = lastRow - firstRow + 1;
+    if (rowCount >= kMinParallelRows && rowCount * std::max(rowWidth, 1) >= kMinParallelPixels)
+    {
+        if (!m_rasterPoolChecked)
+        {
+            m_rasterPoolChecked = true;
+            const unsigned workers = GSRasterWorkerPool::DefaultWorkerCount();
+            if (workers > 0u)
+                m_rasterPool = std::make_unique<GSRasterWorkerPool>(workers);
+        }
+        if (m_rasterPool)
+        {
+            using Rows = std::remove_reference_t<RowFn>;
+            m_rasterPool->Run(firstRow, lastRow, [](void *context, int first, int last, GSMem::TexturePageCache &cache)
+                              { (*static_cast<Rows *>(context))(first, last, cache); },
+                              const_cast<void *>(static_cast<const void *>(&rows)));
+            return;
+        }
+    }
+    rows(firstRow, lastRow, m_texturePageCache);
+}
+
+GSCpuBackend::~GSCpuBackend() = default;
 
 GSCpuBackend::GSCpuBackend()
 {
@@ -667,10 +833,15 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
 
 uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
 {
+    return ReadTextureVramUnlocked(m_texturePageCache, psm, base, bw, x, y);
+}
+
+uint32_t GSCpuBackend::ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+{
     if (!m_vram)
         return 0u;
 
-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
+    return GSMem::ReadTexture(cache, m_vram, psm, base, bw, x, y);
 }
 
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
@@ -1063,7 +1234,8 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     return 0xFFFF00FFu;
 }
 
-uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
+uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v,
+                                     GSMem::TexturePageCache &cache)
 {
     const auto &ctx = state.context;
     const auto &tex = ctx.tex0;
@@ -1096,7 +1268,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
 
-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+        u32 out = ReadTextureVramUnlocked(cache, tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
 
         switch (tex.psm)
         {
@@ -1242,7 +1414,9 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         if (spriteH < 1.0f)
             spriteH = 1.0f;
 
-        for (int y = drawY0; y <= drawY1; ++y)
+        RasterizeRows(drawY0, drawY1, drawX1 - drawX0 + 1, [&](int rowBegin, int rowEnd, GSMem::TexturePageCache &cache)
+                      {
+        for (int y = rowBegin; y <= rowEnd; ++y)
         {
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
@@ -1258,11 +1432,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                     const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
                     const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
                     const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+                    texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV, cache);
                 }
                 else
                 {
-                    texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
+                    texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u, cache);
                 }
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
@@ -1273,13 +1447,15 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
                 const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
                 WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
             }
-        }
+        } });
     }
     else
     {
-        for (int y = drawY0; y <= drawY1; ++y)
+        RasterizeRows(drawY0, drawY1, drawX1 - drawX0 + 1, [&](int rowBegin, int rowEnd, GSMem::TexturePageCache &)
+                      {
+        for (int y = rowBegin; y <= rowEnd; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
-                WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+                WritePixel(state, x, y, z1, r, g, b, a, v1.fog); });
     }
 }
 
@@ -1319,7 +1495,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
 
-    for (int y = minY; y <= maxY; ++y)
+    RasterizeRows(minY, maxY, maxX - minX + 1, [&](int rowBegin, int rowEnd, GSMem::TexturePageCache &cache)
+                  {
+    for (int y = rowBegin; y <= rowEnd; ++y)
     {
         float py = static_cast<float>(y) + 0.5f;
         for (int x = minX; x <= maxX; ++x)
@@ -1375,7 +1553,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
                     iv = 0;
                 }
 
-                uint32_t texel = SampleTexture(state, is, it, iq, iu, iv);
+                uint32_t texel = SampleTexture(state, is, it, iq, iu, iv, cache);
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -1398,7 +1576,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
             WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
         }
-    }
+    } });
 }
 
 void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)

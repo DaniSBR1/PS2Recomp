@@ -4,13 +4,17 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <memory>
 #include <mutex>
 #include <vector>
+
+class GSRasterWorkerPool;
 
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override;
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -38,6 +42,7 @@ private:
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+    uint32_t ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
@@ -45,7 +50,14 @@ private:
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v,
+                           GSMem::TexturePageCache &cache);
+
+    // Runs rows [firstRow, lastRow] of a primitive, splitting large ones across the raster
+    // worker pool. Each row is rasterized exactly as on one thread; only the texture page cache
+    // is per thread.
+    template <typename RowFn>
+    void RasterizeRows(int firstRow, int lastRow, int rowWidth, RowFn &&rows);
     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
@@ -73,6 +85,8 @@ private:
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
+    std::unique_ptr<GSRasterWorkerPool> m_rasterPool;
+    bool m_rasterPoolChecked = false;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
