@@ -845,14 +845,25 @@ void VU1Interpreter::progressXgkick()
     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
         return;
 
+    // A PATH1 packet that would wrap the whole VU1 data memory is dropped, but
+    // the microprogram keeps running (PCSX2 Gif_Unit.h GetGSPacketSize).
+    const uint32_t packetLimit = std::min<uint32_t>(m_activeVuDataSize, XgkickPipeline::kBufferSize);
+    const auto dropXgkick = [this]()
+    {
+        static uint32_t s_droppedXgkicks = 0;
+        if (s_droppedXgkicks++ < 16u)
+            RUNTIME_ERROR("[VU1 xgkick] dropped oversized PATH1 packet from 0x" << std::hex
+                                                                                << m_xgkick.sourceAddress << std::dec << '\n');
+        m_xgkick.active = false;
+    };
+
     ++m_xgkick.cycleCredit;
     while (m_xgkick.active && m_xgkick.cycleCredit >= 2u)
     {
         m_xgkick.cycleCredit -= 2u;
-        if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
+        if (m_xgkick.copiedBytes > packetLimit - 16u)
         {
-            reportReservedInstruction(false, 0xFFFFFFFBu);
-            m_xgkick.active = false;
+            dropXgkick();
             return;
         }
 
@@ -879,19 +890,16 @@ void VU1Interpreter::progressXgkick()
                 tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
             else if (format == 1u)
                 tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
-            else if (format == 2u)
-                tagBytes += static_cast<uint64_t>(nloop) * 16u;
             else
             {
-                reportReservedInstruction(false, 0xFFFFFFF8u);
-                m_xgkick.active = false;
-                return;
+                // FLG 2 = IMAGE. FLG 3 is "disabled" and the GIF treats it as IMAGE
+                // (PCSX2 Gif_Unit.h does the same).
+                tagBytes += static_cast<uint64_t>(nloop) * 16u;
             }
 
-            if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
+            if (tagBytes >= packetLimit - qwordOffset)
             {
-                reportReservedInstruction(false, 0xFFFFFFFBu);
-                m_xgkick.active = false;
+                dropXgkick();
                 return;
             }
             m_xgkick.currentTagEnd = qwordOffset + static_cast<uint32_t>(tagBytes);
@@ -1629,6 +1637,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     m_activeGs = &gs;
     m_activeMemory = memory;
 
+    // vf00 is hardwired to (0, 0, 0, 1): an upper write to it (e.g. a flags-only
+    // MULw.w vf00, ...) must not be visible to the lower op of the same pair.
+    const auto restoreVf0 = [this]()
+    {
+        m_state.vf[0][0] = 0.0f;
+        m_state.vf[0][1] = 0.0f;
+        m_state.vf[0][2] = 0.0f;
+        m_state.vf[0][3] = 1.0f;
+    };
+
     const int previousRoundingMode = std::fegetround();
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
@@ -1646,6 +1664,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
         }
 
+        const bool inBranchDelaySlot = m_state.branchPending && m_state.branchDelay == 0u;
+        const uint32_t delaySlotTarget = m_state.branchTarget;
+        const uint64_t issueCycle = m_cycle;
         uint64_t readyCycle = calculatePairReadyCycle(decoded);
         while (readyCycle > m_cycle)
         {
@@ -1657,6 +1678,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             advanceTo(readyCycle);
             readyCycle = calculatePairReadyCycle(decoded);
         }
+        // A branch only sees the pre-write VI value when it issues right after
+        // the write. If this pair stalled, the write has landed (PCSX2: the
+        // interpreter's VIBackupCycles runs out; microVU's analyzeBranchVI
+        // skips the backup when the branch stalls).
+        if (m_cycle != issueCycle)
+            m_viBranchBackupValid = false;
         if (m_cycle >= budgetEnd)
             break;
 
@@ -1705,6 +1732,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                         m_state.vf[decoded.upperVfShadowReg],
                         sizeof(oldVf));
             execUpper(decoded.upper);
+            restoreVf0();
             std::memcpy(upperVf,
                         m_state.vf[decoded.upperVfShadowReg],
                         sizeof(upperVf));
@@ -1719,9 +1747,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         else
         {
             execUpper(decoded.upper);
+            restoreVf0();
             execLower(decoded.lower, vuData, dataSize, gs, memory, decoded.upper);
         }
 
+        // Repeated writes to the same VI keep the value from before the chain
+        // (PCSX2 _vuBackupVI).
+        const bool chainedViWrite = m_viBranchBackupValid && writtenVi != 0u &&
+                                    m_viBranchBackupReg == writtenVi;
+        const int32_t branchOldVi = chainedViWrite ? m_viBranchBackupValue : oldVi;
         m_viBranchBackupValid = false;
 
         if (hasUpperWrite)
@@ -1765,7 +1799,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         markPairWrites(decoded);
         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
-            recordViWriteForBranch(writtenVi, oldVi);
+            recordViWriteForBranch(writtenVi, branchOldVi);
 
         m_state.vf[0][0] = 0.0f;
         m_state.vf[0][1] = 0.0f;
@@ -1778,7 +1812,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             nextPc = 0u;
         m_state.pc = nextPc;
 
-        if (m_state.branchPending)
+        if (inBranchDelaySlot && m_state.branchPending && m_state.branchDelay != 0u)
+        {
+            // Taken branch in the delay slot of another taken branch: one
+            // instruction runs at the first target, then the second branch is
+            // taken (PCSX2 takedelaybranch).
+            m_state.pc = delaySlotTarget & microAddressMask();
+            m_state.branchDelay = 0u;
+        }
+        else if (m_state.branchPending)
         {
             if (m_state.branchDelay == 0u)
             {
