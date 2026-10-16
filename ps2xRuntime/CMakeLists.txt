@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for ps2EntryRunner")
+set(PS2X_MSVC_MP_PROCESSES "" CACHE STRING "MSVC: cl.exe processes compiling in parallel inside one project (/MP). Empty = from this PC's RAM and cores; 1 = off")
 option(PS2X_ENABLE_RUNNER_PCH "Precompile the heavy runtime headers for ps2EntryRunner" ON)
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
@@ -699,6 +700,31 @@ endif()
 # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
 if(MSVC)
     target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
+endif()
+
+# GoW2-Port: the Visual Studio generator builds the files of one project one after another unless /MP is given
+# (--parallel only runs separate projects at once), so the runner's ~200 unity batches compiled serially: ~40 min with
+# one cl.exe busy. /MP compiles them in parallel. Each batch of generated code needs up to ~1.8 GB (0.7 GB on average),
+# so the default number of processes comes from the RAM as well as the cores: 1.5 GB each, 6 GB left for the system.
+if(MSVC)
+    set(PS2X_MP_COUNT "${PS2X_MSVC_MP_PROCESSES}")
+    if(PS2X_MP_COUNT STREQUAL "")
+        cmake_host_system_information(RESULT PS2X_HOST_CORES QUERY NUMBER_OF_LOGICAL_CORES)
+        cmake_host_system_information(RESULT PS2X_HOST_RAM_MB QUERY TOTAL_PHYSICAL_MEMORY)
+        math(EXPR PS2X_MP_BY_RAM "(${PS2X_HOST_RAM_MB} - 6144) / 1536")
+        set(PS2X_MP_COUNT ${PS2X_HOST_CORES})
+        if(PS2X_MP_BY_RAM LESS PS2X_MP_COUNT)
+            set(PS2X_MP_COUNT ${PS2X_MP_BY_RAM})
+        endif()
+        if(PS2X_MP_COUNT LESS 1)
+            set(PS2X_MP_COUNT 1)
+        endif()
+    endif()
+    if(PS2X_MP_COUNT GREATER 1)
+        target_compile_options(ps2EntryRunner PRIVATE "/MP${PS2X_MP_COUNT}")
+        target_compile_options(ps2_runtime PRIVATE "/MP${PS2X_MP_COUNT}")
+    endif()
+    message(STATUS "PS2X: MSVC parallel compilation /MP${PS2X_MP_COUNT} (PS2X_MSVC_MP_PROCESSES to change it)")
 endif()
 
 # Vita: Work around for GCC 10's LTO plugin
