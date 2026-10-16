@@ -106,6 +106,7 @@ public:
     ~GS() = default;
 
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
+    const struct GSRegisters *privilegedRegisters() const { return m_privRegs; } // GoW2-Port: read only (FPS overlay)
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 

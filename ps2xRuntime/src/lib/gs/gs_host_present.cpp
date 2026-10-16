@@ -3,6 +3,7 @@
 #include "rlgl.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_memory.h"
 #include "ps2_log.h"
 
 #include <algorithm>
@@ -119,8 +120,10 @@ void main()
 
     // GoW2-Port: performance overlay (F10), after PCSX2's PerformanceMetrics + ImGuiManager::DrawPerformanceOverlay
     // (PCSX2, GPLv3+): the metrics are recomputed every 0.5 s; VPS = guest vertical blanks per second (with a 16 sample
-    // average), FPS = new frames the game hands to the GS, speed = VPS against the NTSC rate, frame times from the host
-    // frames. Drawn top right with a drop shadow; the speed line turns red below 95 % and green above 105 %, as in PCSX2.
+    // average), speed = VPS against the NTSC rate, frame times from the host frames. FPS is PCSX2's internal FPS: game
+    // frame flips (a new display buffer, FBP of DISPFB1/2) per second, "[P]"; a game that never flips falls back to the
+    // new frames handed to the GS, "[B]" (PCSX2's framebuffer blits). Drawn top right with a drop shadow; the speed line
+    // turns red below 95 % and green above 105 %, as in PCSX2.
     struct PerfOverlay
     {
         static constexpr double kUpdateInterval = 0.5; // seconds, PCSX2's UPDATE_INTERVAL
@@ -129,6 +132,9 @@ void main()
 
         bool visible = [] { const char *v = std::getenv("GOW_SHOW_FPS"); return v && *v == '1'; }();
         uint64_t gameFrames = 0;   // new GS frames since the last update
+        uint64_t flips = 0;        // display buffer changes since the last update
+        uint64_t lastFbp = ~0ull;
+        bool flipMethod = false;
         uint64_t hostFrames = 0;
         uint64_t lastVsync = 0;
         bool vsyncKnown = false;
@@ -139,9 +145,16 @@ void main()
         // last computed values
         double fps = 0.0, vps = 0.0, avgVps = 0.0, speed = 0.0, hostFps = 0.0, ftMin = 0.0, ftAvg = 0.0, ftMax = 0.0;
 
-        void update(uint64_t vsyncTick)
+        void update(uint64_t vsyncTick, const GSRegisters *regs)
         {
             ++hostFrames;
+            if (regs)
+            {
+                const uint64_t fbp = (regs->dispfb1 & 0x1FFu) | ((regs->dispfb2 & 0x1FFu) << 16);
+                if (lastFbp != ~0ull && fbp != lastFbp)
+                    ++flips;
+                lastFbp = fbp;
+            }
             const double frameMs = GetFrameTime() * 1000.0;
             frameTimeSum += frameMs;
             frameTimeMin = std::min(frameTimeMin, frameMs);
@@ -158,7 +171,8 @@ void main()
             lastUpdate = now;
             vps = static_cast<double>(vsyncTick - lastVsync) / time;
             lastVsync = vsyncTick;
-            fps = static_cast<double>(gameFrames) / time;
+            flipMethod = flips != 0;
+            fps = static_cast<double>(flipMethod ? flips : gameFrames) / time;
             hostFps = static_cast<double>(hostFrames) / time;
             speed = vps / kNtscRate * 100.0;
             ftAvg = frameTimeSum / static_cast<double>(std::max<uint64_t>(hostFrames, 1u));
@@ -174,7 +188,7 @@ void main()
             for (size_t i = 0; i < vpsCount; ++i)
                 sum += vpsHistory[i];
             avgVps = sum / static_cast<double>(vpsCount);
-            gameFrames = hostFrames = 0;
+            gameFrames = hostFrames = flips = 0;
             frameTimeSum = frameTimeMax = 0.0;
             frameTimeMin = 1e9;
         }
@@ -189,11 +203,11 @@ void main()
             const Color white{255, 255, 255, 255};
             const Color speedColor = speed < 95.0 ? Color{255, 100, 100, 255} : speed > 105.0 ? Color{100, 255, 100, 255} : white;
             char lines[4][96];
-            std::snprintf(lines[0], sizeof(lines[0]), "FPS: %.2f", fps);
+            std::snprintf(lines[0], sizeof(lines[0]), "FPS: %.2f %s", fps, flipMethod ? "[P]" : "[B]");
             std::snprintf(lines[1], sizeof(lines[1]), "VPS: %.2f (Avg. %.2f)", vps, avgVps);
             std::snprintf(lines[2], sizeof(lines[2]), "Speed: %u%%", static_cast<unsigned>(std::lround(speed)));
             std::snprintf(lines[3], sizeof(lines[3]), "Host: %.0f FPS | Min: %.2fms | Avg: %.2fms | Max: %.2fms", hostFps, ftMin, ftAvg, ftMax);
-            float y = margin;
+            float y = margin + fontSize * 0.5f;
             for (int i = 0; i < 4; ++i)
             {
                 const Vector2 size = MeasureTextEx(font, lines[i], fontSize, spacing);
@@ -400,7 +414,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
         selected = prepare(gs, vsyncTick);
     }
-    g_perfOverlay.update(vsyncTick);
+    g_perfOverlay.update(vsyncTick, gs.privilegedRegisters());
     BeginDrawing();
     ClearBackground(BLACK);
     const float sourceWidth = static_cast<float>(std::max<uint32_t>(1u, selected.width));
@@ -437,9 +451,9 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
     DrawTexturePro(selected.texture, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     if (scaler)
         EndShaderMode();
-    g_perfOverlay.draw();
     if (overlay)
         overlay();
+    g_perfOverlay.draw(); // last: above the debug UI
     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
     // host_shot.png in the working directory, plus the frame / window sizes, to check presentation without a desktop grab.
     static const long hostShotAt = [] { const char *v = std::getenv("GOW_HOST_SHOT"); return v ? std::atol(v) : -1L; }();

@@ -70,6 +70,11 @@ else()
     set(FETCHCONTENT_QUIET FALSE)
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
+    # GoW2-Port: raylib's built-in F12 screenshot / Ctrl+F12 GIF would fire with the F12 full screen toggle and write
+    # game images to the working directory (the repo root); every other SUPPORT_* keeps its config.h default.
+    set(CUSTOMIZE_BUILD ON CACHE BOOL "" FORCE)
+    set(SUPPORT_SCREEN_CAPTURE OFF CACHE BOOL "" FORCE)
+    set(SUPPORT_GIF_RECORDING OFF CACHE BOOL "" FORCE)
 
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
