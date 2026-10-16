@@ -158,6 +158,8 @@ namespace ps2x::iop::detail
 
     class IopCdvd::Impl
     {
+        friend class IopCdvd; // GoW2-Port: findDiscFile/readDiscFile use the disc helpers below
+
     public:
         struct Callback
         {
@@ -797,5 +799,44 @@ namespace ps2x::iop::detail
     std::optional<IopCdvd::CompletionCallback> IopCdvd::takeCompletionCallback() noexcept
     {
         return m_impl->takeCompletionCallback();
+    }
+
+    std::optional<IopCdvd::DiscFileInfo> IopCdvd::findDiscFile(const std::string &guestPath)
+    {
+        if (DiscSource *source = m_impl->discSource())
+        {
+            const std::optional<DiscSource::File> found = source->findFile(guestPath);
+            if (!found || found->directory)
+                return std::nullopt;
+            return DiscFileInfo{found->lsn, found->size};
+        }
+        const auto *node = m_impl->findVirtualIsoNode(guestPath);
+        if (!node || node->directory)
+            return std::nullopt;
+        return DiscFileInfo{node->lsn, node->size};
+    }
+
+    uint32_t IopCdvd::readDiscFile(uint32_t lsn, uint32_t fileSize, uint32_t offset, uint32_t size, uint8_t *destination)
+    {
+        if (offset >= fileSize || size == 0u || destination == nullptr)
+            return 0u;
+        size = std::min(size, fileSize - offset);
+        const uint32_t firstSector = offset / kSectorSize;
+        const uint32_t lastSector = (offset + size - 1u) / kSectorSize;
+        const uint32_t count = lastSector - firstSector + 1u;
+        std::vector<uint8_t> sectors(static_cast<size_t>(count) * kSectorSize, 0u);
+        bool read = false;
+        if (DiscSource *source = m_impl->discSource())
+            read = source->readSectors(lsn + firstSector, count, sectors.data());
+        else if (m_impl->buildVirtualIso())
+        {
+            read = true;
+            for (uint32_t i = 0u; i < count && read; ++i)
+                read = m_impl->readVirtualSector(lsn + firstSector + i, sectors.data() + static_cast<size_t>(i) * kSectorSize);
+        }
+        if (!read)
+            return 0u;
+        std::memcpy(destination, sectors.data() + (offset - firstSector * kSectorSize), size);
+        return size;
     }
 }
