@@ -297,6 +297,10 @@ namespace ps2x::iop::detail
         case 41:
             setV0(0);
             return true;
+        case 43: // GetSystemTimeLow: low word of the system timer, same units as GetSystemTime
+            // GoW2-Port: God of War II's smpd calls it around its disc reads.
+            setV0(static_cast<uint32_t>(currentCycle));
+            return true;
         default:
             return false;
         }

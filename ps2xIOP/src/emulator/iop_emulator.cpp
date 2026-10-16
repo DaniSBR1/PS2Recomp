@@ -338,30 +338,17 @@ namespace ps2x::iop::detail
             if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 
-            if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
-            {
-                return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "thsemap"))
-            {
-                return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "thevent"))
-            {
-                return kernel.dispatchEventImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "sifcmd"))
-            {
-                return rpc.dispatchSifCmdImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
-            }
+            // GoW2-Port: an ordinal these libraries do not handle falls through to the "unhandled import"
+            // warning below (and returns 0) instead of failing silently with $v0 untouched.
+            if ((iequals(call.library, "thbase") || iequals(call.library, "threadman")) &&
+                kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles))
+                return ImportDisposition::Handled;
+            if (iequals(call.library, "thsemap") && kernel.dispatchSemaphoreImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
+            if (iequals(call.library, "thevent") && kernel.dispatchEventImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
+            if (iequals(call.library, "sifcmd") && rpc.dispatchSifCmdImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
             if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
             if (iequals(call.library, "secrman"))
@@ -402,7 +389,8 @@ namespace ps2x::iop::detail
                 if (rpc.takeDmaCompletionCallback(callback))
                     pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
                                                   ScheduledGuestCallback{callback.function, callback.gp, callback.argument});
-                return handled ? ImportDisposition::Handled : ImportDisposition::Missing;
+                if (handled)
+                    return ImportDisposition::Handled;
             }
             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
                 return ImportDisposition::Handled;
@@ -416,12 +404,8 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
-            if (iequals(call.library, "sysclib"))
-            {
-                return sysclib.dispatchImport(call.ordinal, cpu)
-                           ? ImportDisposition::Handled
-                           : ImportDisposition::Missing;
-            }
+            if (iequals(call.library, "sysclib") && sysclib.dispatchImport(call.ordinal, cpu))
+                return ImportDisposition::Handled;
             if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
                 return ImportDisposition::Handled;
 

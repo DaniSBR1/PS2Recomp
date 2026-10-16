@@ -16,5 +16,6 @@ namespace ps2x::iop::detail
 
     private:
         IopMemory &m_memory;
+        uint32_t m_strtokNext = 0u; // GoW2-Port: strtok position for calls with a NULL string
     };
 }

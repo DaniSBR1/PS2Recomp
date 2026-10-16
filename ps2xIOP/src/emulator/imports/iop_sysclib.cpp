@@ -310,9 +310,44 @@ namespace ps2x::iop::detail
                       : a0 + static_cast<uint32_t>(position));
             return true;
         }
-        case 35: // strtok state is intentionally not shared across modules yet.
-            setV0(0);
+        case 35: // strtok: one saved position, like the single static of the real sysclib
+        {
+            // GoW2-Port: God of War II's smpd splits its argument ("wad/,...,sound/") with strtok;
+            // returning 0 left all its search paths NULL.
+            uint32_t cursor = a0 != 0u ? a0 : m_strtokNext;
+            if (cursor == 0u)
+            {
+                setV0(0);
+                return true;
+            }
+            const std::string delimiters = m_memory.readString(a1, 4096u);
+            const auto isDelimiter = [&](uint8_t character)
+            {
+                return character != 0u && delimiters.find(static_cast<char>(character)) != std::string::npos;
+            };
+            while (isDelimiter(m_memory.read8(cursor)))
+                ++cursor;
+            if (m_memory.read8(cursor) == 0u)
+            {
+                m_strtokNext = 0u;
+                setV0(0);
+                return true;
+            }
+            const uint32_t token = cursor;
+            while (m_memory.read8(cursor) != 0u && !isDelimiter(m_memory.read8(cursor)))
+                ++cursor;
+            if (m_memory.read8(cursor) != 0u)
+            {
+                m_memory.write8(cursor, 0u);
+                m_strtokNext = cursor + 1u;
+            }
+            else
+            {
+                m_strtokNext = 0u;
+            }
+            setV0(token);
             return true;
+        }
         case 36:
         case 38: // strtol / strtoul
         {
