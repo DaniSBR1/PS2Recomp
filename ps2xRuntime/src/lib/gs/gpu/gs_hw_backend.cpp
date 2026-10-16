@@ -1390,17 +1390,21 @@ struct GSHwBackend::Impl
         const GSVertex &a = b.vertices[0], &e = b.vertices[1];
         const float ofx = c.xyoffset.ofx / 16.0f, ofy = c.xyoffset.ofy / 16.0f;
         const float fx0 = std::min(a.x, e.x) - ofx, fx1 = std::max(a.x, e.x) - ofx, fy0 = std::min(a.y, e.y) - ofy, fy1 = std::max(a.y, e.y) - ofy;
+        // the start must be a whole pixel; the end may be fractional: the GS covers x0 <= x < x1, so the last covered pixel
+        // is ceil(x1) - 1 (God of War II ends its full-height column copies at y = 895.4375, i.e. 896 rows)
         const auto whole = [](float v) { return std::fabs(v - std::round(v)) < 1e-3f && v >= 0.0f; };
-        if (!whole(fx0) || !whole(fx1) || !whole(fy0) || !whole(fy1))
+        if (!whole(fx0) || !whole(fy0) || fx1 < 0.0f || fy1 < 0.0f)
             { shuffleWhy = 9; return false; }
-        const int x0 = static_cast<int>(std::lround(fx0)), x1 = static_cast<int>(std::lround(fx1));
-        const int y0 = static_cast<int>(std::lround(fy0)), y1 = static_cast<int>(std::lround(fy1));
+        const int x0 = static_cast<int>(std::lround(fx0)), x1 = static_cast<int>(std::ceil(fx1 - 1e-3f));
+        const int y0 = static_cast<int>(std::lround(fy0)), y1 = static_cast<int>(std::ceil(fy1 - 1e-3f));
         const GSVertex &left = (a.x <= e.x) ? a : e;
         const GSVertex &top = (a.y <= e.y) ? a : e;
         const int du = static_cast<int>(std::floor(left.u / 16.0f)) - x0, dv = static_cast<int>(std::floor(top.v / 16.0f)) - y0;
-        const int uSpan = static_cast<int>(std::lround(std::fabs(static_cast<float>(a.u) - static_cast<float>(e.u)) / 16.0f));
-        const int vSpan = static_cast<int>(std::lround(std::fabs(static_cast<float>(a.v) - static_cast<float>(e.v)) / 16.0f));
-        if (((x0 | x1 | y0 | y1 | du | dv) & 7) != 0 || x1 <= x0 || y1 <= y0 || uSpan != x1 - x0 || vSpan != y1 - y0)
+        // texels 1:1: the texture span equals the position span (both in 1/16 units)
+        const float uSpan = std::fabs(static_cast<float>(a.u) - static_cast<float>(e.u)) / 16.0f;
+        const float vSpan = std::fabs(static_cast<float>(a.v) - static_cast<float>(e.v)) / 16.0f;
+        if (((x0 | x1 | y0 | y1 | du | dv) & 7) != 0 || x1 <= x0 || y1 <= y0 || std::fabs(uSpan - (fx1 - fx0)) > 1e-2f ||
+            std::fabs(vSpan - (fy1 - fy0)) > 1e-2f)
             { shuffleWhy = 10; return false; }
         if (x0 + du < 0 || y0 + dv < 0 || x0 < static_cast<int>(c.scissor.x0) || y0 < static_cast<int>(c.scissor.y0) ||
             x1 - 1 > static_cast<int>(c.scissor.x1) || y1 - 1 > static_cast<int>(c.scissor.y1))
