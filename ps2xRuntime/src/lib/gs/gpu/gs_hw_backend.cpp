@@ -1373,12 +1373,20 @@ struct GSHwBackend::Impl
         // a Z16 view reads a Z buffer, or a colour target laid out as Z (the address mapping covers both)
         RenderTarget *src = nullptr;
         bool srcDepth = false;
+        // several targets may share that Z memory (God of War II: the frame's 512 px wide target and a 128 px wide
+        // one): take the one laid out with the view's width, the latest depth writer among equals
         if (zTex)
             for (RenderTarget &t : targets)
                 if (t.depth && t.zbp == c.tex0.tbp0 / 32u && t.fbp != t.zbp)
                 {
-                    src = &t;
-                    srcDepth = true;
+                    const bool widthMatches = t.fbw == c.tex0.tbw;
+                    const bool srcWidthMatches = src && src->fbw == c.tex0.tbw;
+                    if (!src || (widthMatches && !srcWidthMatches) ||
+                        (widthMatches == srcWidthMatches && t.lastDepthSeq >= src->lastDepthSeq))
+                    {
+                        src = &t;
+                        srcDepth = true;
+                    }
                 }
         if (!src)
             if (RenderTarget *t = findTarget(c.tex0.tbp0 / 32u))
