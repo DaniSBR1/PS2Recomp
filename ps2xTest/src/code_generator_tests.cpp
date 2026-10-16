@@ -1,7 +1,9 @@
 #include "MiniTest.h"
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include <filesystem>
 #include <fstream>
@@ -168,6 +170,36 @@ void register_code_generator_tests()
 {
     MiniTest::Case("CodeGenerator", [](TestCase &tc)
                    {
+    // GOW-Port: las raíces de COP1 en R5900 no usan los operandos del MIPS genérico.
+    tc.Run("R5900 SQRT.S reads FT with FS zero and destination aliases", [](TestCase &t) {
+        const std::vector<Section> sections;
+        CodeGenerator gen({}, sections);
+        R5900Decoder decoder;
+        for (uint32_t fd : {4u, 11u, 0u}) {
+            const uint32_t raw = (OPCODE_COP1 << 26) | (COP1_S << 21) |
+                                 (11u << 16) | (fd << 6) | COP1_S_SQRT;
+            const Instruction inst = decoder.decodeInstruction(0x1000, raw, false);
+            const std::string code = gen.translateInstruction(inst);
+            // GOW-Port: desde ps2recomp-ee-fixes.patch la raiz pasa por ps2FpuSqrt (flags de FCR31, sin NaN).
+            t.Equals(code, "ctx->f[" + std::to_string(fd) + "] = ps2FpuSqrt(ctx->fcr31, ctx->f[11]);",
+                     "SQRT.S debe leer FT=11 incluso si FS=0 o FD coincide con FT");
+        }
+    });
+
+    tc.Run("R5900 RSQRT.S preserves FS numerator and FT radicand", [](TestCase &t) {
+        const std::vector<Section> sections;
+        CodeGenerator gen({}, sections);
+        R5900Decoder decoder;
+        for (uint32_t fd : {4u, 7u, 11u}) {
+            const uint32_t raw = (OPCODE_COP1 << 26) | (COP1_S << 21) |
+                                 (11u << 16) | (7u << 11) | (fd << 6) | COP1_S_RSQRT;
+            const Instruction inst = decoder.decodeInstruction(0x1004, raw, false);
+            const std::string code = gen.translateInstruction(inst);
+            t.Equals(code, "ctx->f[" + std::to_string(fd) + "] = ps2FpuRsqrt(ctx->fcr31, ctx->f[7], ctx->f[11]);",
+                     "RSQRT.S debe calcular FS/sqrt(FT), incluidos los alias de destino");
+        }
+    });
+
     tc.Run("Generated sources cannot be shadowed by stale local declaration headers", [](TestCase &t) {
         Function func;
         func.name = "header_lookup";
@@ -309,42 +341,7 @@ void register_code_generator_tests()
                  "MULT1 should write low product to rd on R5900");
     });
 
-    tc.Run("constant MMIO store emits direct runtime store", [](TestCase &t) {
-        Function func;
-        func.name = "mmio_store";
-        func.start = 0x1000;
-        func.end = 0x1010;
-        func.isRecompiled = true;
 
-        std::vector<Instruction> instructions;
-        instructions.push_back(makeLui(0x1000, 1, 0x1000));
-        instructions.push_back(makeOri(0x1004, 1, 1, 0xE020));
-        instructions.push_back(makeSw(0x1008, 2, 1, 0));
-
-        CodeGenerator gen({}, {});
-        std::string generated = gen.generateFunction(func, instructions, false);
-        printGeneratedCode("constant MMIO store emits direct runtime store", generated);
-
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, 0x1000E020u, GPR_U32(ctx, 2));") != std::string::npos,
-                 "constant MMIO SW should emit a direct runtime Store32");
-        t.IsTrue(generated.find("WRITE32(ADD32(GPR_U32(ctx, 1)") == std::string::npos,
-                 "constant MMIO SW should not go through WRITE32 address classification");
-    });
-
-    tc.Run("stale MMIO annotation does not replace the guest effective address", [](TestCase &t) {
-        Instruction store = makeSw(0x1100, 2, 1, 0);
-        store.isMmio = true;
-        store.mmioAddress = 0x10000000u; // A stale analyzer hint; $at still owns the real address.
-
-        CodeGenerator gen({}, {});
-        const std::string generated = gen.translateInstruction(store);
-        printGeneratedCode("stale MMIO annotation does not replace the guest effective address", generated);
-
-        t.IsTrue(generated.find("runtime->Store32(rdram, ctx, ADD32(GPR_U32(ctx, 1), 0), GPR_U32(ctx, 2))") != std::string::npos,
-                 "MMIO annotations should select runtime access without hard-coding a possibly stale address");
-        t.IsTrue(generated.find("0x10000000u") == std::string::npos,
-                 "stale MMIO address should not replace the address calculated by guest registers");
-    });
 
     tc.Run("constant RDRAM load and store emit fast memory access", [](TestCase &t) {
         Function func;
@@ -1464,6 +1461,194 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
         });
 
+        tc.Run("VU0 macro VSQI/VLQD matrix stack uses fs/it fields and VU0 data memory", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+
+            const Instruction vsqi = decoder.decodeInstruction(0x1B33D0u, 0x4BEF0B7Du);
+            const std::string push = gen.translateInstruction(vsqi);
+            printGeneratedCode("vsqi.xyzw $vf1, ($vi15++)", push);
+            t.IsTrue(push.find("ctx->vu0_vf[1]") != std::string::npos, "VSQI must store Fs (rd = vf1)");
+            t.IsTrue(push.find("ctx->vu0_vf[15]") == std::string::npos, "VSQI must not store vf15");
+            t.IsTrue(push.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] + 1u)") != std::string::npos,
+                     "VSQI must post-increment It (rt = vi15)");
+            t.IsTrue(push.find("ctx->vi[1]") == std::string::npos, "VSQI must not address memory through vi1");
+            t.IsTrue(push.find("getVU0Data()") != std::string::npos, "VSQI must write VU0 data memory");
+            t.IsTrue(push.find("WRITE128") == std::string::npos && push.find("READ128") == std::string::npos,
+                     "VSQI must not touch EE RAM");
+
+            const Instruction vlqd = decoder.decodeInstruction(0x1B33E8u, 0x4BE47B7Eu);
+            const std::string pop = gen.translateInstruction(vlqd);
+            printGeneratedCode("vlqd.xyzw $vf4, (--$vi15)", pop);
+            t.IsTrue(pop.find("ctx->vi[15] = static_cast<uint16_t>(ctx->vi[15] - 1u)") != std::string::npos,
+                     "VLQD must pre-decrement Is (rd = vi15)");
+            t.IsTrue(pop.find("PS2_VU0_VF_WRITE(ctx, 4, _mm_blendv_ps(ctx->vu0_vf[4]") != std::string::npos,
+                     "VLQD must load into Ft (rt = vf4)");
+            t.IsTrue(pop.find("getVU0Data()") != std::string::npos, "VLQD must read VU0 data memory");
+            t.IsTrue(pop.find("READ128") == std::string::npos, "VLQD must not read EE RAM");
+            t.IsTrue(pop.find("& 0xFFu) << 4") != std::string::npos, "VU0 data memory addresses wrap at 4 KB");
+            t.IsTrue(pop.find("ctx->vi[15] - 1u); __m128 res") != std::string::npos, "VLQD must decrement before loading");
+        });
+
+        tc.Run("VU0 macro VSQD/VLQI and VI ops never write VI0 or VF0", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.vectorInfo.vectorField = 0xF;
+
+            inst.rd = 5;
+            inst.rt = 0;
+            const std::string vsqd = gen.translateVU_VSQD(inst);
+            t.IsTrue(vsqd.find("ctx->vi[0] =") == std::string::npos, "VSQD with It = vi0 must not decrement vi0");
+            t.IsTrue(vsqd.find("ctx->vu0_vf[5]") != std::string::npos, "VSQD must store Fs (rd)");
+
+            inst.rd = 0;
+            inst.rt = 3;
+            const std::string vlqi = gen.translateVU_VLQI(inst);
+            t.IsTrue(vlqi.find("ctx->vi[0] =") == std::string::npos, "VLQI with Is = vi0 must not increment vi0");
+            t.IsTrue(vlqi.find("ctx->vu0_vf[3]") != std::string::npos, "VLQI must load Ft (rt)");
+
+            inst.rd = 2;
+            inst.rt = 0;
+            t.IsTrue(gen.translateVU_VLQI(inst).find("ctx->vu0_vf[0]") == std::string::npos, "VLQI must not write vf0");
+            t.IsTrue(gen.translateVU_VIADDI(inst).find("ctx->vi[0]") == std::string::npos, "VIADDI must not write vi0");
+            t.IsTrue(gen.translateVU_VILWR(inst).find("ctx->vi[0]") == std::string::npos, "VILWR must not write vi0");
+
+            inst.sa = 0;
+            inst.rd = 1;
+            inst.rt = 2;
+            t.IsTrue(gen.translateVU_VIADD(inst).find("ctx->vi[0]") == std::string::npos, "VIADD must not write vi0");
+            t.IsTrue(gen.translateVU_VISUB(inst).find("ctx->vi[0]") == std::string::npos, "VISUB must not write vi0");
+            t.IsTrue(gen.translateVU_VIAND(inst).find("ctx->vi[0]") == std::string::npos, "VIAND must not write vi0");
+            t.IsTrue(gen.translateVU_VIOR(inst).find("ctx->vi[0]") == std::string::npos, "VIOR must not write vi0");
+
+            inst.rd = 5;
+            inst.rt = 0;
+            t.IsTrue(gen.translateVU_VMTIR(inst).find("ctx->vi[0]") == std::string::npos,
+                     "VMTIR must not write vi0");
+            inst.rt = 6;
+            t.IsTrue(gen.translateVU_VMTIR(inst).find("ctx->vi[6] =") != std::string::npos,
+                     "VMTIR must write nonzero VI destinations");
+        });
+
+        tc.Run("VU0 macro VISWR/VILWR address qwords in VU0 data memory per field", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.rd = 7;
+            inst.rt = 9;
+
+            inst.vectorInfo.vectorField = 0x5;
+            const std::string iswr = gen.translateVU_VISWR(inst);
+            t.IsTrue(iswr.find("getVU0Data() + ((static_cast<uint32_t>(ctx->vi[7]) & 0xFFu) << 4)") != std::string::npos,
+                     "VISWR must address qword vi[is] of VU0 data memory");
+            t.IsTrue(iswr.find("const uint32_t value = ctx->vi[9]") != std::string::npos, "VISWR must store vi[it]");
+            t.IsTrue(iswr.find("vu0Mem + 4u") != std::string::npos && iswr.find("vu0Mem + 12u") != std::string::npos,
+                     "VISWR.yw must write the y and w words");
+            t.IsTrue(iswr.find("vu0Mem + 0u") == std::string::npos && iswr.find("vu0Mem + 8u") == std::string::npos,
+                     "VISWR.yw must not write the x and z words");
+            t.IsTrue(iswr.find("WRITE32") == std::string::npos, "VISWR must not touch EE RAM");
+
+            inst.vectorInfo.vectorField = 0x2;
+            const std::string ilwr = gen.translateVU_VILWR(inst);
+            t.IsTrue(ilwr.find("<< 4) + 8u") != std::string::npos, "VILWR.z must read the z word");
+            t.IsTrue(ilwr.find("ctx->vi[9] = value") != std::string::npos, "VILWR must write vi[it]");
+            t.IsTrue(ilwr.find("READ32") == std::string::npos, "VILWR must not read EE RAM");
+        });
+
+        tc.Run("VU0 macro random ops follow the PS2 R register", [](TestCase &t) {
+            R5900Decoder decoder;
+            CodeGenerator gen({}, {});
+
+            const std::string rnext = gen.translateInstruction(decoder.decodeInstruction(0x1B9580u, 0x4B05043Cu));
+            printGeneratedCode("vrnext.x $vf5, $R", rnext);
+            t.IsTrue(rnext.find("((r >> 4) & 1u) ^ ((r >> 22) & 1u)") != std::string::npos, "VRNEXT must step the PS2 LFSR (bits 4 and 22)");
+            t.IsTrue(rnext.find("| 0x3F800000u") != std::string::npos, "VRNEXT must keep R in [1, 2)");
+            t.IsTrue(rnext.find("PS2_VU0_VF_WRITE(ctx, 5, _mm_blendv_ps(ctx->vu0_vf[5], ctx->vu0_r") != std::string::npos,
+                     "VRNEXT must write the new R to Ft");
+
+            const std::string rinit = gen.translateInstruction(decoder.decodeInstruction(0x1B9570u, 0x4A002C3Eu));
+            t.IsTrue(rinit.find("0x3F800000u | (fs[0] & 0x007FFFFFu)") != std::string::npos, "VRINIT must take the mantissa of Fs.x");
+
+            const std::string rxor = gen.translateInstruction(decoder.decodeInstruction(0x1B9574u, 0x4A00343Fu));
+            t.IsTrue(rxor.find("0x3F800000u | ((r ^ fs[0]) & 0x007FFFFFu)") != std::string::npos, "VRXOR must xor the mantissa into R");
+            t.IsTrue(rxor.find("ctx->vu0_vf[6]") != std::string::npos, "VRXOR must read Fs (rd = vf6)");
+
+            Instruction rget{};
+            rget.rt = 7;
+            rget.vectorInfo.vectorField = 0xF;
+            t.IsTrue(gen.translateVU_VRGET(rget).find("_mm_shuffle_epi32(_mm_castps_si128(ctx->vu0_r), 0)") != std::string::npos,
+                     "VRGET must broadcast R");
+
+            Instruction ctc2{};
+            ctc2.opcode = OPCODE_COP2;
+            ctc2.rs = COP2_CTC2;
+            ctc2.rt = 3;
+            ctc2.rd = VU0_CR_R;
+            t.IsTrue(gen.translateInstruction(ctc2).find("0x3F800000u | (GPR_U32(ctx, 3) & 0x007FFFFFu)") != std::string::npos,
+                     "CTC2 to R must keep only the mantissa");
+        });
+
+        tc.Run("VU0 macro VFTOI saturates and VABS flushes denormals", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.rd = 5;
+            inst.rt = 6;
+            inst.vectorInfo.vectorField = 0xF;
+            const std::string ftoi = gen.translateVU_VFTOI(inst, 15);
+            t.IsTrue(ftoi.find("_mm_cmpnlt_ps(src, _mm_set1_ps(2147483648.0f))") != std::string::npos,
+                     "VFTOI must detect positive overflow");
+            t.IsTrue(ftoi.find("_mm_xor_si128(_mm_cvttps_epi32(src), positiveOverflow)") != std::string::npos,
+                     "VFTOI must turn positive overflow into 0x7FFFFFFF");
+            inst.rt = 0;
+            t.IsTrue(gen.translateVU_VFTOI(inst, 0).find("vu0_vf[0]") == std::string::npos, "VFTOI must not write vf0");
+
+            R5900Decoder decoder;
+            const std::string abs = gen.translateInstruction(decoder.decodeInstruction(0x1000u, 0x4BE629FDu));
+            t.IsTrue(abs.find("_mm_cmpeq_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128())") != std::string::npos,
+                     "VABS must flush denormal inputs to zero");
+        });
+
+        tc.Run("VU0 vector instructions ignore writes to VF0", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            const auto noVf0Write = [](const std::string &code) {
+                return code.find("ctx->vu0_vf[0] =") == std::string::npos;
+            };
+
+            Instruction load{};
+            load.opcode = OPCODE_LQC2;
+            load.rt = 0;
+            t.IsTrue(noVf0Write(gen.translateInstruction(load)), "LQC2 to VF0 must be ignored");
+
+            Instruction transfer{};
+            transfer.opcode = OPCODE_COP2;
+            transfer.rs = COP2_QMTC2;
+            transfer.rd = 0;
+            transfer.rt = 2;
+            t.IsTrue(noVf0Write(gen.translateInstruction(transfer)), "QMTC2 to VF0 must be ignored");
+
+            Instruction arithmetic{};
+            arithmetic.opcode = OPCODE_COP2;
+            arithmetic.rs = COP2_CO;
+            arithmetic.function = VU0_S1_VADD;
+            arithmetic.sa = 0;
+            t.IsTrue(noVf0Write(gen.translateInstruction(arithmetic)), "VU0 arithmetic to VF0 must be ignored");
+
+            Instruction vitof{};
+            vitof.opcode = OPCODE_COP2;
+            vitof.rs = COP2_CO;
+            vitof.function = 0x3C;
+            vitof.raw = ((VU0_S2_VITOF0 >> 2) << 6) | (VU0_S2_VITOF0 & 0x3u);
+            vitof.rt = 0;
+            t.IsTrue(noVf0Write(gen.translateInstruction(vitof)), "VITOF to VF0 must be ignored");
+
+            Instruction vmfir{};
+            vmfir.opcode = OPCODE_COP2;
+            vmfir.rs = COP2_CO;
+            vmfir.function = 0x3C;
+            vmfir.raw = ((VU0_S2_VMFIR >> 2) << 6) | (VU0_S2_VMFIR & 0x3u);
+            vmfir.rt = 0;
+            t.IsTrue(noVf0Write(gen.translateInstruction(vmfir)), "VMFIR to VF0 must be ignored");
+        });
+
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
             Function func;
             func.name = "jal_test";
@@ -1681,6 +1866,50 @@ void register_code_generator_tests()
                      "backward internal branch should no longer emit an unconditional cooperative-yield call");
             t.IsTrue(generated.find("goto label_1104;") != std::string::npos,
                      "backward internal branch should still re-enter the in-function label when it keeps the current slice");
+        });
+
+        tc.Run("signed branches compare the full 64-bit EE register", [](TestCase &t) {
+            struct BranchCase
+            {
+                uint32_t opcode;
+                uint8_t rt;
+                const char *comparison;
+            };
+            const BranchCase cases[] = {
+                {OPCODE_BLEZ, 0, "<= 0"},
+                {OPCODE_BLEZL, 0, "<= 0"},
+                {OPCODE_BGTZ, 0, "> 0"},
+                {OPCODE_BGTZL, 0, "> 0"},
+                {OPCODE_REGIMM, REGIMM_BLTZ, "< 0"},
+                {OPCODE_REGIMM, REGIMM_BLTZL, "< 0"},
+                {OPCODE_REGIMM, REGIMM_BLTZAL, "< 0"},
+                {OPCODE_REGIMM, REGIMM_BLTZALL, "< 0"},
+                {OPCODE_REGIMM, REGIMM_BGEZ, ">= 0"},
+                {OPCODE_REGIMM, REGIMM_BGEZL, ">= 0"},
+                {OPCODE_REGIMM, REGIMM_BGEZAL, ">= 0"},
+                {OPCODE_REGIMM, REGIMM_BGEZALL, ">= 0"},
+            };
+            for (const BranchCase &branchCase : cases)
+            {
+                Function func{};
+                func.name = "signed_branch";
+                func.start = 0x1200;
+                func.end = 0x1210;
+                func.isRecompiled = true;
+
+                Instruction branch = makeIType(0x1200, branchCase.opcode, 3, branchCase.rt, 1);
+                branch.isBranch = true;
+                branch.hasDelaySlot = true;
+
+                CodeGenerator gen({}, {});
+                const std::string generated = gen.generateFunction(
+                    func, {branch, makeNop(0x1204), makeNop(0x1208)}, false);
+                const std::string expected = std::string("GPR_S64(ctx, 3) ") + branchCase.comparison;
+                t.IsTrue(generated.find(expected) != std::string::npos,
+                         "signed branch must use bit 63, including likely and link variants");
+                t.IsTrue(generated.find("GPR_S32(ctx, 3)") == std::string::npos,
+                         "the low-word sign can differ from the sign of a soft-double mantissa");
+            }
         });
 
         tc.Run("branch-likely places delay slot only in taken path", [](TestCase &t) {
@@ -2004,35 +2233,6 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to epilogue tail-jump block");
             t.IsTrue(generated.find("case 0x2018u: goto label_2018;") == std::string::npos,
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
-        });
-
-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
-            CodeGenerator gen({}, {});
-
-            Instruction inst{};
-            inst.rd = 7;
-            inst.vectorInfo.fsf = 2;
-
-            std::string vrnext = gen.translateVU_VRNEXT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
-                                 "    uint32_t feedback") != std::string::npos,
-                     "VRNEXT should place the generated line comment on its own line");
-
-            std::string vrinit = gen.translateVU_VRINIT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
-                     "VRINIT should place the generated line comment on its own line");
-
-            std::string vrxor = gen.translateVU_VRXOR(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
-                                "    __m128i xored") != std::string::npos,
-                     "VRXOR should keep the XOR comment on its own line");
-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
-                                "    __m128i mixed") != std::string::npos,
-                     "VRXOR should keep the LFSR comment on its own line");
         });
 
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {

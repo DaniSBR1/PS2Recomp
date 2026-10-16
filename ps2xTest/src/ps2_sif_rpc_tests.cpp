@@ -193,7 +193,7 @@ void register_ps2_sif_rpc_tests()
         {
             TestEnv env;
 
-            env.runtime.eeScheduler().accountCycles(80u);
+            env.runtime.eeScheduler().accountCycles(8u * 4096u); // GOW-Port: el IOP avanza por lotes de 512 ciclos
             const uint64_t cyclesBeforeInit = env.runtime.iopDebugSnapshot().emulatorCycles;
             t.IsTrue(cyclesBeforeInit != 0u, "IOP cycle counter should advance before RPC initialization");
 

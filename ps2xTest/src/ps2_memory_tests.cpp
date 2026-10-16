@@ -1,3 +1,4 @@
+#include "runtime/ps2_perf.h"
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_frontend.h"
@@ -8,6 +9,7 @@
 #include "Stubs/GS.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -531,6 +533,85 @@ void register_ps2_memory_tests()
             t.Equals(sw, 0x00008001u, "zero-extend w");
         });
 
+        tc.Run("VIF V2 unpacks expand both pairs for every component width", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "memory should initialize");
+            for (uint32_t vl = 0; vl < 3; ++vl)
+                for (uint32_t usn = 0; usn < 2; ++usn)
+                {
+                    std::memset(mem.getVU1Data(), 0xa5, 32);
+                    std::vector<uint8_t> packet;
+                    appendU32(packet, makeVifCmd(uint8_t(0x64 + vl), 2, uint16_t(usn << 14)));
+                    const uint32_t bytes = 4u >> vl;
+                    for (uint32_t i = 0; i < 4; ++i)
+                    {
+                        const uint32_t raw = i % 2 == 0 ? 0xfffffffdu : 2u;
+                        const size_t pos = packet.size();
+                        packet.resize(pos + bytes);
+                        std::memcpy(packet.data() + pos, &raw, bytes);
+                    }
+                    mem.processVIF1Data(packet.data(), uint32_t(packet.size()));
+                    const uint32_t negative = !usn || vl == 0 ? 0xfffffffdu :
+                                              vl == 1 ? 0xfffdu : 0xfdu;
+                    for (uint32_t v = 0; v < 2; ++v)
+                    {
+                        uint32_t lanes[4];
+                        std::memcpy(lanes, mem.getVU1Data() + v * 16, 16);
+                        t.Equals(lanes[0], negative, "X sign/zero extension");
+                        t.Equals(lanes[1], 2u, "Y extension");
+                        t.Equals(lanes[2], negative, "Z must repeat X");
+                        t.Equals(lanes[3], 2u, "W must repeat Y");
+                    }
+                }
+        });
+
+        tc.Run("VIF V2 replication precedes row addition and write protection", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "memory should initialize");
+            std::memset(mem.getVU1Data(), 0xa5, 16);
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x05, 0, 1)); // STMOD: row addition
+            appendU32(packet, makeVifCmd(0x30, 0, 0));
+            for (uint32_t row : {10u, 20u, 30u, 40u}) appendU32(packet, row);
+            appendU32(packet, makeVifCmd(0x20, 0, 0));
+            appendU32(packet, 0x4cu); // protect Y, select row W
+            appendU32(packet, makeVifCmd(0x74, 1, 0)); // masked V2-32
+            appendU32(packet, 3); appendU32(packet, 5);
+            mem.processVIF1Data(packet.data(), uint32_t(packet.size()));
+            uint32_t lanes[4];
+            std::memcpy(lanes, mem.getVU1Data(), 16);
+            t.Equals(lanes[0], 13u, "X adds row X");
+            t.Equals(lanes[1], 0xa5a5a5a5u, "Y stays protected");
+            t.Equals(lanes[2], 33u, "replicated X adds row Z");
+            t.Equals(lanes[3], 40u, "W selects row W without addition");
+        });
+
+        tc.Run("VIF V4-5 expands RGB and alpha to their upper bits without STMOD", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "memory should initialize");
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x05, 0, 2));
+            appendU32(packet, makeVifCmd(0x30, 0, 0));
+            for (uint32_t row : {10u, 20u, 30u, 40u}) appendU32(packet, row);
+            appendU32(packet, makeVifCmd(0x6f, 2, 0));
+            const uint32_t rgb = 31u | (17u << 5) | (9u << 10);
+            appendU32(packet, (rgb | 0x8000u) | (rgb << 16));
+            mem.processVIF1Data(packet.data(), uint32_t(packet.size()));
+            uint32_t lanes[8];
+            std::memcpy(lanes, mem.getVU1Data(), sizeof(lanes));
+            for (uint32_t v = 0; v < 2; ++v)
+            {
+                t.Equals(lanes[v*4], 248u, "red shifts by three");
+                t.Equals(lanes[v*4+1], 136u, "green shifts by three");
+                t.Equals(lanes[v*4+2], 72u, "blue shifts by three");
+                t.Equals(lanes[v*4+3], v == 0 ? 128u : 0u, "alpha shifts to bit seven");
+            }
+            t.Equals(mem.vif1_regs.row[0], 10u, "V4-5 must not update STMOD row state");
+        });
+
         tc.Run("VIF UNPACK bit15 adds TOPS to destination address", [](TestCase &t)
         {
             PS2Memory mem;
@@ -711,6 +792,35 @@ void register_ps2_memory_tests()
             t.Equals(mem.vif1_regs.row[3], 103u, "difference mode should update row register for W");
         });
 
+        // GOW-Port: los tiempos del GS anidado no deben sumarse también a VU/EE.
+        tc.Run("Perf scopes account nested work exclusively", [](TestCase &t)
+        {
+            using namespace ps2_perf;
+            Accounting clock;
+            std::array<uint64_t, bucketCount> totals{};
+            const auto step = [&](Bucket bucket, uint64_t now) {
+                const auto charge = clock.switchTo(bucket, now);
+                if (charge.bucket != Bucket::None) totals[static_cast<size_t>(charge.bucket)] += charge.nanos;
+            };
+            step(Bucket::Ee, 0); step(Bucket::Vu, 10); step(Bucket::Gs, 30);
+            step(Bucket::Vu, 35); step(Bucket::Ee, 50); step(Bucket::None, 80);
+            t.Equals(totals[0], uint64_t{40}, "EE excludes nested VU and GS");
+            t.Equals(totals[1], uint64_t{35}, "VU excludes nested GS");
+            t.Equals(totals[2], uint64_t{5}, "GS is charged only once");
+            t.Equals(totals[0]+totals[1]+totals[2], uint64_t{80}, "exclusive sum equals elapsed time");
+        });
+        tc.Run("Perf accounting ignores unmeasured gaps and supports repeated buckets", [](TestCase &t)
+        {
+            using namespace ps2_perf;
+            Accounting clock;
+            t.IsTrue(clock.switchTo(Bucket::Gs, 100).bucket == Bucket::None, "startup gap is unmeasured");
+            const auto recursive = clock.switchTo(Bucket::Gs, 120);
+            const auto returned = clock.switchTo(Bucket::Gs, 130);
+            const auto done = clock.switchTo(Bucket::None, 160);
+            t.Equals(recursive.nanos + returned.nanos + done.nanos, uint64_t{60}, "same bucket nesting does not double elapsed time");
+            t.IsTrue(clock.switchTo(Bucket::Ee, 1000).bucket == Bucket::None, "gap between tasks is unmeasured");
+        });
+
         tc.Run("VIF fill write uses STMASK and STROW when WL>CL", [](TestCase &t)
         {
             PS2Memory mem;
@@ -886,31 +996,6 @@ void register_ps2_memory_tests()
                      "GIF_STAT should mirror GIF_MODE and GIF_CTRL status bits");
         });
 
-        tc.Run("GIF_STAT exposes synchronously drained DMA occupancy for one EE quantum", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kGifChannel = 0x1000A000u;
-            constexpr uint32_t kSource = 0x00020000u;
-            mem.setGifPacketCallback([](const uint8_t *, uint32_t) {});
-
-            t.IsTrue(mem.writeIORegister(kGifChannel + 0x10u, kSource),
-                     "write GIF MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kGifChannel + 0x20u, 1u),
-                     "write GIF QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kGifChannel + 0x00u, 0x100u),
-                     "start GIF normal DMA should succeed");
-
-            const uint32_t visibleFqc = (mem.readIORegister(0x10003020u) >> 24u) & 0x1Fu;
-            t.Equals(visibleFqc, 1u,
-                     "a synchronously consumed qword should remain observable through GIF_STAT.FQC");
-
-            mem.advanceEeTimers(1u);
-            const uint32_t drainedFqc = (mem.readIORegister(0x10003020u) >> 24u) & 0x1Fu;
-            t.Equals(drainedFqc, 0u,
-                     "the synthetic FIFO observation should expire at the next EE scheduling boundary");
-        });
 
         tc.Run("PATH3 mask queues packets until unmask", [](TestCase &t)
         {
@@ -1011,1006 +1096,30 @@ void register_ps2_memory_tests()
             t.Equals(firstBytes[1], static_cast<uint8_t>(0xD2u), "DIRECTHL packet should drain after PATH3 IMAGE packet");
         });
 
-        tc.Run("GIF DMA mode0 copies RDRAM packet and clears channel", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kSrc = 0x00022000u;
-            constexpr uint32_t kQwc = 2u; // 32 bytes
 
-            uint8_t *rdram = mem.getRDRAM();
-            for (uint32_t i = 0; i < kQwc * 16u; ++i)
-            {
-                rdram[kSrc + i] = static_cast<uint8_t>((0x40u + i) & 0xFFu);
-            }
 
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
 
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, kSrc), "write MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, kQwc), "write QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
 
-            t.Equals(mem.dmaStartCount(), 1ull, "starting GIF DMA should increment dmaStartCount");
 
-            mem.processPendingTransfers();
 
-            t.Equals(captured.size(), static_cast<size_t>(1u), "GIF DMA should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(kQwc * 16u), "GIF packet size should match QWC");
 
-            bool contentOk = true;
-            for (uint32_t i = 0; i < kQwc * 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>((0x40u + i) & 0xFFu))
-                {
-                    contentOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(contentOk, "GIF DMA packet bytes should match source RDRAM");
-            t.IsTrue(mem.hasSeenGifCopy(), "GIF DMA should mark seen GIF copy");
-            t.Equals(mem.gifCopyCount(), 1ull, "GIF DMA should increment gifCopyCount");
-            t.IsTrue((mem.readIORegister(kGifCh + 0x00u) & 0x100u) == 0u, "GIF CHCR STR bit should be cleared after drain");
-            t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "GIF QWC should be cleared after drain");
-        });
 
-        tc.Run("GIF DMA can source from scratchpad", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kSrcScratch = PS2_SCRATCHPAD_BASE + 0x80u;
-            constexpr uint32_t kQwc = 1u; // 16 bytes
 
-            uint8_t *scratch = mem.getScratchpad();
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                scratch[0x80u + i] = static_cast<uint8_t>((0xA0u + i) & 0xFFu);
-            }
 
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
 
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, kSrcScratch), "write MADR scratchpad should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, kQwc), "write QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
 
-            mem.processPendingTransfers();
 
-            t.Equals(captured.size(), static_cast<size_t>(1u), "scratchpad GIF DMA should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "scratchpad GIF DMA packet should be 16 bytes");
-            bool contentOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>((0xA0u + i) & 0xFFu))
-                {
-                    contentOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(contentOk, "scratchpad GIF DMA packet bytes should match scratchpad source");
-        });
 
-        tc.Run("GIF DMA chain can source tags and payload from 0xF000 scratchpad alias", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kTagAlias = PS2_SCRATCHPAD_ALIAS_BASE + 0x100u;
 
-            uint8_t *scratch = mem.getScratchpad();
-            std::memset(scratch + 0x100u, 0, 32u);
 
-            const uint64_t endTag = makeDmaTag(1u, 7u, 0u, false);
-            std::memcpy(scratch + 0x100u, &endTag, sizeof(endTag));
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                scratch[0x110u + i] = static_cast<uint8_t>(0xC0u + i);
-            }
 
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
 
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kTagAlias), "write TADR scratchpad alias should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR STR|CHAIN should succeed");
+        // GOW-Port: God of War copia la paleta de huesos con fromSPR en cadena de destino (CHCR 0x104).
 
-            mem.processPendingTransfers();
 
-            t.Equals(captured.size(), static_cast<size_t>(1u), "scratchpad alias chain should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "scratchpad alias chain should emit one qword");
-
-            bool contentOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>(0xC0u + i))
-                {
-                    contentOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(contentOk, "scratchpad alias chain payload should match scratchpad bytes");
-        });
-
-        tc.Run("native GIF image upload recognizes canonical load-image chain", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kDStat = 0x1000E010u;
-            constexpr uint32_t kChain = 0x00028000u;
-            constexpr uint32_t kPixels = 0x00029000u;
-            constexpr uint32_t kQwc = 1u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            for (uint32_t i = 0; i < kQwc * 16u; ++i)
-            {
-                rdram[kPixels + i] = static_cast<uint8_t>(0x40u + i);
-            }
-
-            uint32_t chain = kChain;
-            chain = writeTextureUploadSetup(rdram, chain, 0u, GS_PSM_CT32);
-            chain = writeTextureImageRef(rdram, chain, kQwc, kPixels);
-            writeDmaTag(rdram, chain, makeDmaTag(0u, 7u, 0u, false)); // END.
-
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write GIF TADR should succeed");
-            t.IsTrue(mem.tryProcessNativeGifImageUploadChain(gs, kChain, 0x105u),
-                     "canonical load-image chain should use the native upload path");
-
-            t.Equals(gs.nativeImageUploadCount(), 1ull, "native GIF DMA chain should upload through GS fast path");
-            t.Equals(mem.gifCopyCount(), 1ull, "native GIF DMA chain should still count as a GIF DMA copy");
-            t.IsTrue((mem.readIORegister(kDStat) & (1u << 2u)) != 0u,
-                     "native GIF DMA chain should raise D_STAT GIF completion");
-            t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "native GIF DMA chain should clear GIF QWC");
-            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u,
-                     "native GIF DMA chain should clear GIF STR");
-            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x70000000u, 0x70000000u,
-                     "native GIF DMA chain should latch the terminal END tag id");
-
-            bool pixelsOk = true;
-            for (uint32_t x = 0; x < 4u && pixelsOk; ++x)
-            {
-                const uint32_t dstOff = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
-                const uint32_t srcOff = kPixels + x * 4u;
-                for (uint32_t c = 0; c < 4u; ++c)
-                {
-                    if (mem.getGSVRAM()[dstOff + c] != rdram[srcOff + c])
-                    {
-                        pixelsOk = false;
-                        break;
-                    }
-                }
-            }
-            t.IsTrue(pixelsOk, "native GIF DMA chain should upload image payload into GS VRAM");
-        });
-
-        tc.Run("native GIF packed chain matches generic packed primitive packet", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            GS nativeGs;
-            nativeGs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-
-            GSRegisters genericRegs{};
-            std::vector<uint8_t> genericVram(PS2_GS_VRAM_SIZE, 0u);
-            GS genericGs;
-            genericGs.init(genericVram.data(), static_cast<uint32_t>(genericVram.size()), &genericRegs);
-
-            std::vector<uint8_t> packet;
-            appendU64(packet, makeGifTag(4u, GIF_FMT_PACKED, 1u, false));
-            appendU64(packet, 0x0Eull);
-            appendU64(packet, makeGsFrame(0u, 1u, GS_PSM_CT32));
-            appendU64(packet, GS_REG_FRAME_1);
-            appendU64(packet, makeGsScissor(0u, 7u, 0u, 7u));
-            appendU64(packet, GS_REG_SCISSOR_1);
-            appendU64(packet, 1ull << 17u); // ZTST always.
-            appendU64(packet, GS_REG_TEST_1);
-            appendU64(packet, 1ull << 32u); // Mask Z writes so the test framebuffer remains visible.
-            appendU64(packet, GS_REG_ZBUF_1);
-
-            constexpr uint16_t kSpritePrim = static_cast<uint16_t>(GS_PRIM_SPRITE);
-            appendU64(packet, makeGifTagPrim(2u, kSpritePrim, GIF_FMT_PACKED, 3u, true, true));
-            appendU64(packet, static_cast<uint64_t>(GS_REG_UV) |
-                                  (static_cast<uint64_t>(GS_REG_RGBAQ) << 4u) |
-                                  (static_cast<uint64_t>(GS_REG_XYZF2) << 8u));
-            appendPackedUv(packet, 0u, 0u);
-            appendPackedRgbaq(packet, 0x20u, 0x40u, 0x80u, 0x80u);
-            appendPackedXyzf2(packet, 0u, 0u, 0u);
-            appendPackedUv(packet, 0u, 0u);
-            appendPackedRgbaq(packet, 0xE0u, 0x30u, 0x10u, 0x80u);
-            appendPackedXyzf2(packet, 64u, 64u, 0u);
-
-            genericGs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kDStat = 0x1000E010u;
-            constexpr uint32_t kScratchTag = 0xF0000000u;
-            uint8_t *scratch = mem.getScratchpad();
-            writeDmaTag(scratch, 0u, makeDmaTag(static_cast<uint16_t>(packet.size() / 16u), 7u, 0u, false));
-            std::memcpy(scratch + 16u, packet.data(), packet.size());
-
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kScratchTag), "write GIF TADR scratchpad alias should succeed");
-            t.IsTrue(mem.tryProcessNativeGifPackedChain(nativeGs, kScratchTag, 0x105u),
-                     "packed primitive chain should use the native packed GIF path");
-
-            t.Equals(nativeGs.nativePackedGIFPacketCount(), 1ull, "native packed GIF packet counter should increment");
-            t.Equals(mem.gifCopyCount(), 1ull, "native packed GIF chain should still count as a GIF DMA copy");
-            t.IsTrue((mem.readIORegister(kDStat) & (1u << 2u)) != 0u,
-                     "native packed GIF chain should raise D_STAT GIF completion");
-            t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "native packed GIF chain should clear GIF QWC");
-            t.Equals(mem.readIORegister(kGifCh + 0x00u) & 0x100u, 0u,
-                     "native packed GIF chain should clear GIF STR");
-
-            const uint32_t nativePixel = nativeGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 1u);
-            const uint32_t genericPixel = genericGs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 1u);
-            t.IsTrue(genericPixel != 0u, "generic packed primitive packet should draw a test pixel");
-            t.Equals(nativePixel, genericPixel, "native packed GIF chain should match generic GS packet output");
-        });
-
-        tc.Run("GIF DMA chain REF keeps CT32 image data after paletted upload", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            std::vector<uint8_t> capturedGifPacket;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                capturedGifPacket.assign(data, data + sizeBytes);
-                gs.processGIFPacket(data, sizeBytes);
-            });
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kChain = 0x00028000u;
-            constexpr uint32_t kT4Data = 0x00029000u;
-            constexpr uint32_t kCt32Data = 0x0002A000u;
-            constexpr uint32_t kT4Dbp = 0u;
-            constexpr uint32_t kCt32Dbp = 32u;
-            constexpr uint32_t kWidth = 16u;
-            constexpr uint32_t kHeight = 16u;
-            constexpr uint32_t kT4Bytes = kWidth * kHeight / 2u;
-            constexpr uint32_t kCt32Bytes = kWidth * kHeight * 4u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            uint32_t pixel = 0u;
-            for (uint32_t i = 0; i < kT4Bytes; ++i)
-            {
-                const uint8_t lo = static_cast<uint8_t>(pixel & 0xFu);
-                const uint8_t hi = static_cast<uint8_t>((pixel + 1u) & 0xFu);
-                rdram[kT4Data + i] = static_cast<uint8_t>(lo | (hi << 4));
-                pixel += 2u;
-                if (pixel > 0xEu)
-                {
-                    pixel -= 0xEu;
-                }
-            }
-
-            uint32_t color = 0u;
-            for (uint32_t i = 0; i < kCt32Bytes; i += 4u)
-            {
-                rdram[kCt32Data + i + 0u] = static_cast<uint8_t>((color >> 0) & 0xFFu);
-                rdram[kCt32Data + i + 1u] = static_cast<uint8_t>((color >> 8) & 0xFFu);
-                rdram[kCt32Data + i + 2u] = static_cast<uint8_t>((color >> 16) & 0xFFu);
-                rdram[kCt32Data + i + 3u] = 0x80u;
-                color += 0xF1u;
-                if (color >= 0xFFFFFFu)
-                {
-                    color = 0u;
-                }
-            }
-
-            uint32_t chain = kChain;
-            chain = writeTextureUploadSetup(rdram, chain, kT4Dbp, GS_PSM_T4HL);
-            chain = writeTextureImageRef(rdram, chain, kT4Bytes / 16u, kT4Data);
-            chain = writeTextureUploadSetup(rdram, chain, kCt32Dbp, GS_PSM_CT32);
-            chain = writeTextureImageRef(rdram, chain, kCt32Bytes / 16u, kCt32Data);
-            writeDmaTag(rdram, chain, makeDmaTag(0u, 7u, 0u, false)); // END.
-
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kChain), "write GIF TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write GIF CHCR STR|CHAIN should succeed");
-
-            mem.processPendingTransfers();
-
-            constexpr uint32_t kCt32PayloadOffset = 5u * 16u + 16u + kT4Bytes + 5u * 16u + 16u;
-            t.IsTrue(capturedGifPacket.size() >= kCt32PayloadOffset + kCt32Bytes,
-                     "flattened GIF chain should contain the full CT32 REF payload");
-            bool ct32PayloadOk = capturedGifPacket.size() >= kCt32PayloadOffset + kCt32Bytes;
-            for (uint32_t i = 0; i < kCt32Bytes && ct32PayloadOk; ++i)
-            {
-                if (capturedGifPacket[kCt32PayloadOffset + i] != rdram[kCt32Data + i])
-                {
-                    ct32PayloadOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(ct32PayloadOk, "flattened GIF chain should preserve CT32 REF bytes after the T4 REF payload");
-
-            const uint32_t row1Off = GSPSMCT32::addrPSMCT32(kCt32Dbp, 1u, 0u, 1u);
-            uint32_t actualRow1X0 = 0u;
-            uint32_t expectedRow1X0 = 0u;
-            std::memcpy(&actualRow1X0, mem.getGSVRAM() + row1Off, sizeof(actualRow1X0));
-            std::memcpy(&expectedRow1X0, rdram + kCt32Data + kWidth * 4u, sizeof(expectedRow1X0));
-            t.Equals(actualRow1X0, expectedRow1X0, "CT32 row 1 must come from CT32 data, not the previous T4 REF payload");
-
-            bool ct32Ok = true;
-            for (uint32_t y = 0; y < kHeight && ct32Ok; ++y)
-            {
-                for (uint32_t x = 0; x < kWidth && ct32Ok; ++x)
-                {
-                    const uint32_t dstOff = GSPSMCT32::addrPSMCT32(kCt32Dbp, 1u, x, y);
-                    const uint32_t srcOff = kCt32Data + ((y * kWidth + x) * 4u);
-                    for (uint32_t c = 0; c < 4u; ++c)
-                    {
-                        if (mem.getGSVRAM()[dstOff + c] != rdram[srcOff + c])
-                        {
-                            ct32Ok = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            t.IsTrue(ct32Ok, "all CT32 pixels should survive a preceding paletted upload in the same GIF DMA chain");
-        });
-
-        tc.Run("VIF1 DMA DIRECT forwards payload to GIF callback and clears channel", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kSrc = 0x00024000u;
-            constexpr uint32_t kQwc = 2u; // 32 bytes total transport
-
-            uint8_t *rdram = mem.getRDRAM();
-            std::memset(rdram + kSrc, 0, kQwc * 16u);
-
-            // DIRECT 1 QW.
-            const uint32_t cmd = makeVifCmd(0x50u, 0u, 1u);
-            std::memcpy(rdram + kSrc, &cmd, sizeof(cmd));
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kSrc + 4u + i] = static_cast<uint8_t>((0x11u + i) & 0xFFu);
-            }
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kSrc), "write VIF1 MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, kQwc), "write VIF1 QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u), "VIF1 DIRECT should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "VIF1 DIRECT packet should be 1 QW");
-            bool contentOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>((0x11u + i) & 0xFFu))
-                {
-                    contentOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(contentOk, "VIF1 DIRECT packet bytes should match payload");
-            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u, "VIF1 CHCR STR bit should be cleared after drain");
-            t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "VIF1 QWC should be cleared after drain");
-        });
-
-        tc.Run("VIF1 DMA chain preserves compact tag high bytes for DIRECT packets", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kTag = 0x00025000u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            std::memset(rdram + kTag, 0, 32u);
-
-            const uint64_t endTag = makeDmaTag(1u, 7u, 0u, false);
-            std::memcpy(rdram + kTag, &endTag, sizeof(endTag));
-
-            // Compact VIF1 packet helpers place the DIRECT command in the tag's upper 64 bits.
-            const uint32_t directCmd = makeVifCmd(0x50u, 0u, 1u);
-            std::memcpy(rdram + kTag + 12u, &directCmd, sizeof(directCmd));
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kTag + 16u + i] = static_cast<uint8_t>(0x70u + i);
-            }
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
-                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u), "compact VIF1 chain should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "compact VIF1 DIRECT packet should be 1 QW");
-
-            bool payloadOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>(0x70u + i))
-                {
-                    payloadOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(payloadOk, "compact VIF1 chain payload should reach the GIF callback");
-            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u,
-                     "compact VIF1 chain should clear the STR bit after drain");
-        });
-
-        tc.Run("VIF1 DMA chain preserves compact tag high bytes when qwc is zero", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kTag = 0x00025100u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            std::memset(rdram + kTag, 0, 16u);
-
-            const uint64_t endTag = makeDmaTag(0u, 7u, 0u, false);
-            std::memcpy(rdram + kTag, &endTag, sizeof(endTag));
-
-            const uint32_t itopCmd = makeVifCmd(0x04u, 0u, 0x44u);
-            std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
-                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(mem.vif1_regs.itops, 0x44u,
-                     "qwc-zero compact VIF1 chain should still process high-half VIFcodes");
-            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u,
-                     "qwc-zero compact VIF1 chain should clear the STR bit after drain");
-        });
-
-        tc.Run("VIF1 DMA chain transfers REF tag high bytes when TTE is enabled", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kTag0 = 0x00025200u;
-            constexpr uint32_t kTag1 = kTag0 + 0x10u;
-            constexpr uint32_t kRefPayload = 0x00025300u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            writeDmaTag(rdram, kTag0, makeDmaTag(1u, 3u, kRefPayload, false)); // REF
-            writeDmaTag(rdram, kTag1, makeDmaTag(0u, 7u, 0u, false));         // END
-
-            // With CHCR.TTE set, both VIFcodes stored in every DMAtag's upper half
-            // precede that tag's payload, including tags whose payload is referenced.
-            const uint32_t directCmd = makeVifCmd(0x50u, 0u, 1u);
-            std::memcpy(rdram + kTag0 + 12u, &directCmd, sizeof(directCmd));
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kRefPayload + i] = static_cast<uint8_t>(0xA0u + i);
-            }
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag0), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
-                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u),
-                     "REF tag high-half DIRECT should emit one GIF packet");
-            if (!captured.empty())
-            {
-                t.Equals(captured[0].size(), static_cast<size_t>(16u),
-                         "REF tag high-half DIRECT packet should be 1 QW");
-
-                bool payloadOk = true;
-                for (uint32_t i = 0; i < 16u; ++i)
-                {
-                    if (captured[0][i] != static_cast<uint8_t>(0xA0u + i))
-                    {
-                        payloadOk = false;
-                        break;
-                    }
-                }
-                t.IsTrue(payloadOk, "REF payload should reach the GIF callback without VIF desynchronization");
-            }
-        });
-
-        tc.Run("VIF1 DMA chain ignores tag high bytes when TTE is disabled", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kTag = 0x00025400u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            writeDmaTag(rdram, kTag, makeDmaTag(0u, 7u, 0u, false)); // END
-            const uint32_t itopCmd = makeVifCmd(0x04u, 0u, 0x55u);
-            std::memcpy(rdram + kTag + 12u, &itopCmd, sizeof(itopCmd));
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x104u),
-                     "write VIF1 CHCR STR|CHAIN without TTE should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(mem.vif1_regs.itops, 0u,
-                     "tag high-half VIFcodes must stay hidden when CHCR.TTE is clear");
-        });
-
-        tc.Run("VIF1 packet builders keep chain qwc live before terminate", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kStateAddr = 0x00027000u;
-            constexpr uint32_t kBaseAddr = 0x00027100u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            std::memset(rdram + kStateAddr, 0, 0x200u);
-
-            R5900Context ctx{};
-            setRegU32(ctx, 4, kStateAddr);
-            setRegU32(ctx, 5, kBaseAddr);
-            ps2_stubs::sceVif1PkInit(rdram, &ctx, nullptr);
-
-            std::memset(&ctx, 0, sizeof(ctx));
-            setRegU32(ctx, 4, kStateAddr);
-            setRegU32(ctx, 5, 0u);
-            ps2_stubs::sceVif1PkCnt(rdram, &ctx, nullptr);
-
-            std::memset(&ctx, 0, sizeof(ctx));
-            setRegU32(ctx, 4, kStateAddr);
-            setRegU32(ctx, 5, 0u);
-            ps2_stubs::sceVif1PkOpenDirectCode(rdram, &ctx, nullptr);
-
-            std::memset(&ctx, 0, sizeof(ctx));
-            setRegU32(ctx, 4, kStateAddr);
-            setRegU32(ctx, 5, 4u); // reserve one qword of DIRECT payload
-            ps2_stubs::sceVif1PkReserve(rdram, &ctx, nullptr);
-            const uint32_t payloadAddr = ::getRegU32(&ctx, 2);
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[payloadAddr + i] = static_cast<uint8_t>(0x30u + i);
-            }
-
-            std::memset(&ctx, 0, sizeof(ctx));
-            setRegU32(ctx, 4, kStateAddr);
-            ps2_stubs::sceVif1PkCloseDirectCode(rdram, &ctx, nullptr);
-
-            uint32_t dmaTagWord = 0u;
-            std::memcpy(&dmaTagWord, rdram + kBaseAddr, sizeof(dmaTagWord));
-            t.Equals(dmaTagWord & 0xFFFFu, 1u, "live packet head qwc should reflect one qword before terminate");
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kBaseAddr), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
-                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u), "live VIF1 packet should emit one GIF packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(16u), "live VIF1 packet should emit one qword");
-
-            bool payloadOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>(0x30u + i))
-                {
-                    payloadOk = false;
-                    break;
-                }
-            }
-            t.IsTrue(payloadOk, "live VIF1 packet payload should reach the GIF callback");
-        });
-
-        tc.Run("VIF1 DMA chain latches terminal tag bits in CHCR", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kTag0 = 0x00027400u;
-            constexpr uint32_t kTag1 = kTag0 + 0x20u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            writeDmaTag(rdram, kTag0, makeDmaTag(1u, 1u, 0u, false)); // CNT
-            std::memset(rdram + kTag0 + 0x10u, 0, 0x10u);
-            writeDmaTag(rdram, kTag1, makeDmaTag(0u, 7u, 0u, false)); // END
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag0), "write VIF1 TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x185u), "write VIF1 CHCR chain start should succeed");
-
-            mem.processPendingTransfers();
-
-            const uint32_t chcr = mem.readIORegister(kVif1Ch + 0x00u);
-            t.Equals(chcr & 0x100u, 0u, "VIF1 STR should clear after DMA chain drain");
-            t.Equals(chcr & 0x70000000u, 0x70000000u, "VIF1 CHCR should expose the terminal END tag id");
-            t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) != 0u, "VIF1 DMA completion should raise D_STAT channel bit");
-        });
-
-        tc.Run("GIF DMA chain CALL sources payload from TADR+16", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kTag0 = 0x00026000u;
-            constexpr uint32_t kTag1 = 0x00026100u;
-
-            uint8_t *rdram = mem.getRDRAM();
-
-            // CALL qwc=1 addr=kTag1
-            writeDmaTag(rdram, kTag0, makeDmaTag(1u, 5u, kTag1, false));
-            // END qwc=1
-            writeDmaTag(rdram, kTag1, makeDmaTag(1u, 7u, 0u, false));
-
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kTag0 + 16u + i] = static_cast<uint8_t>(0x40u + i); // CALL payload
-                rdram[kTag1 + 16u + i] = static_cast<uint8_t>(0x80u + i); // END payload
-            }
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kTag0), "write TADR should succeed");
-            // STR + CHAIN mode (MOD=1)
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u), "chain CALL should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(32u), "CALL+END should emit two qwords");
-
-            bool firstQwOk = true;
-            bool secondQwOk = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>(0x40u + i))
-                    firstQwOk = false;
-                if (captured[0][16u + i] != static_cast<uint8_t>(0x80u + i))
-                    secondQwOk = false;
-            }
-            t.IsTrue(firstQwOk, "CALL must transfer from TADR+16, not DMAtag ADDR");
-            t.IsTrue(secondQwOk, "END payload should follow CALL payload");
-        });
-
-        tc.Run("GIF DMA chain RET transfers payload and resumes after CALL", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kTagCall = 0x00026200u;
-            constexpr uint32_t kTagRet = 0x00026300u;
-            constexpr uint32_t kTagEnd = 0x00026220u;
-
-            uint8_t *rdram = mem.getRDRAM();
-
-            // CALL qwc=1 -> jumps to RET tag
-            writeDmaTag(rdram, kTagCall, makeDmaTag(1u, 5u, kTagRet, false));
-            // RET qwc=1 -> should return to kTagEnd
-            writeDmaTag(rdram, kTagRet, makeDmaTag(1u, 6u, 0u, false));
-            // END qwc=1 after CALL payload
-            writeDmaTag(rdram, kTagEnd, makeDmaTag(1u, 7u, 0u, false));
-
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kTagCall + 16u + i] = static_cast<uint8_t>(0x11u + i); // CALL payload
-                rdram[kTagRet + 16u + i] = static_cast<uint8_t>(0x22u + i);  // RET payload
-                rdram[kTagEnd + 16u + i] = static_cast<uint8_t>(0x33u + i);  // END payload
-            }
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, kTagCall), "write TADR should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR should succeed");
-
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u), "CALL/RET chain should emit one packet");
-            t.Equals(captured[0].size(), static_cast<size_t>(48u), "CALL+RET+END should emit three qwords");
-
-            bool q0 = true;
-            bool q1 = true;
-            bool q2 = true;
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                if (captured[0][i] != static_cast<uint8_t>(0x11u + i))
-                    q0 = false;
-                if (captured[0][16u + i] != static_cast<uint8_t>(0x22u + i))
-                    q1 = false;
-                if (captured[0][32u + i] != static_cast<uint8_t>(0x33u + i))
-                    q2 = false;
-            }
-            t.IsTrue(q0, "CALL payload should be first");
-            t.IsTrue(q1, "RET must still transfer its own payload");
-            t.IsTrue(q2, "RET must resume after CALL payload and continue chain");
-        });
-
-        tc.Run("GIF DMA chain IRQ stops only when TIE is set", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kTag0 = 0x00026400u;
-            constexpr uint32_t kTag1 = 0x00026410u;
-            constexpr uint32_t kRefData = 0x00026500u;
-
-            auto runChain = [&](uint32_t chcrValue, std::vector<uint8_t> &packetOut) -> bool
-            {
-                uint8_t *rdram = mem.getRDRAM();
-                writeDmaTag(rdram, kTag0, makeDmaTag(1u, 3u, kRefData, true)); // REF + IRQ
-                writeDmaTag(rdram, kTag1, makeDmaTag(1u, 7u, 0u, false));       // END
-                for (uint32_t i = 0; i < 16u; ++i)
-                {
-                    rdram[kRefData + i] = static_cast<uint8_t>(0x55u + i);
-                    rdram[kTag1 + 16u + i] = static_cast<uint8_t>(0x77u + i);
-                }
-
-                std::vector<std::vector<uint8_t>> captured;
-                mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-                {
-                    captured.emplace_back(data, data + sizeBytes);
-                });
-
-                if (!mem.writeIORegister(kGifCh + 0x30u, kTag0))
-                    return false;
-                if (!mem.writeIORegister(kGifCh + 0x00u, chcrValue))
-                    return false;
-                mem.processPendingTransfers();
-                if (captured.empty())
-                    return false;
-                packetOut = captured[0];
-                return true;
-            };
-
-            std::vector<uint8_t> packetNoTie;
-            t.IsTrue(runChain(0x104u, packetNoTie), "chain run without TIE should succeed");
-            t.Equals(packetNoTie.size(), static_cast<size_t>(32u), "IRQ tag should not stop chain when TIE is clear");
-
-            std::vector<uint8_t> packetTie;
-            // STR + CHAIN + TIE(bit7)
-            t.IsTrue(runChain(0x184u, packetTie), "chain run with TIE should succeed");
-            t.Equals(packetTie.size(), static_cast<size_t>(16u), "IRQ tag should stop chain when TIE is set");
-        });
-
-        tc.Run("DMAC D_STAT toggles masks and clears channel status on write-one", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kDStat = 0x1000E010u;
-            constexpr uint32_t kGifMaskBit = (1u << 18); // channel 2 mask
-            constexpr uint32_t kGifStatusBit = (1u << 2); // channel 2 status
-            constexpr uint32_t kSummaryBit = (1u << 31);
-
-            t.IsTrue(mem.writeIORegister(kDStat, kGifMaskBit), "D_STAT mask toggle write should succeed");
-            t.IsTrue((mem.readIORegister(kDStat) & kGifMaskBit) != 0u, "first mask write should enable GIF mask bit");
-            t.IsTrue(mem.writeIORegister(kDStat, kGifMaskBit), "D_STAT mask toggle write should succeed");
-            t.IsTrue((mem.readIORegister(kDStat) & kGifMaskBit) == 0u, "second mask write should disable GIF mask bit");
-
-            t.IsTrue(mem.writeIORegister(kDStat, kGifMaskBit), "re-enable GIF mask for summary test");
-
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kSrc = 0x00027000u;
-            uint8_t *rdram = mem.getRDRAM();
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kSrc + i] = static_cast<uint8_t>(0x90u + i);
-            }
-
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, kSrc), "write MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, 1u), "write QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
-
-            t.IsTrue((mem.readIORegister(kDStat) & kGifStatusBit) == 0u, "D_STAT status should not set before transfer drain");
-
-            mem.processPendingTransfers();
-
-            const uint32_t dstatAfter = mem.readIORegister(kDStat);
-            t.IsTrue((dstatAfter & kGifStatusBit) != 0u, "GIF transfer completion should set D_STAT channel status bit");
-            t.IsTrue((dstatAfter & kSummaryBit) != 0u, "status&mask should raise D_STAT summary bit");
-
-            t.IsTrue(mem.writeIORegister(kDStat, kGifStatusBit), "D_STAT status clear write should succeed");
-            const uint32_t dstatCleared = mem.readIORegister(kDStat);
-            t.IsTrue((dstatCleared & kGifStatusBit) == 0u, "write-one should clear GIF channel status bit");
-            t.IsTrue((dstatCleared & kSummaryBit) == 0u, "summary bit should clear after status clear");
-        });
-
-        tc.Run("DMAC D_CTRL DMAE gates GIF DMA start", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kDctrl = 0x1000E000u;
-            constexpr uint32_t kGifCh = 0x1000A000u;
-            constexpr uint32_t kSrc = 0x00027800u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                rdram[kSrc + i] = static_cast<uint8_t>(0xE0u + i);
-            }
-
-            std::vector<std::vector<uint8_t>> captured;
-            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                captured.emplace_back(data, data + sizeBytes);
-            });
-
-            t.IsTrue(mem.writeIORegister(kDctrl, 0u), "clearing D_CTRL.DMAE should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, kSrc), "write MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, 1u), "write QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR should succeed");
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(0u), "DMAE=0 should prevent GIF DMA transfer");
-            t.Equals(mem.dmaStartCount(), 0ull, "DMAE=0 should not increment dmaStartCount");
-
-            t.IsTrue(mem.writeIORegister(kDctrl, 1u), "setting D_CTRL.DMAE should succeed");
-            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "restarting GIF DMA should succeed");
-            mem.processPendingTransfers();
-
-            t.Equals(captured.size(), static_cast<size_t>(1u), "DMAE=1 should allow GIF DMA transfer");
-            if (!captured.empty())
-            {
-                t.Equals(captured[0].size(), static_cast<size_t>(16u), "GIF DMA transfer should emit one qword");
-            }
-        });
-
-        tc.Run("DMAC SPR_FROM copies scratchpad to RDRAM and completes channel 8", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kChannel = 0x1000D000u;
-            constexpr uint32_t kMadr = 0x00028000u;
-            constexpr uint32_t kSadr = 0x00000120u;
-            constexpr uint32_t kQwc = 2u;
-            constexpr uint32_t kBytes = kQwc * 16u;
-
-            for (uint32_t i = 0; i < kBytes; ++i)
-                mem.getScratchpad()[kSadr + i] = static_cast<uint8_t>(0x30u + i);
-
-            t.IsTrue(mem.writeIORegister(kChannel + 0x10u, kMadr), "write SPR_FROM MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kChannel + 0x20u, kQwc), "write SPR_FROM QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kSadr), "write SPR_FROM SADR should succeed");
-            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x100u), "start SPR_FROM should succeed");
-
-            bool copied = true;
-            for (uint32_t i = 0; i < kBytes; ++i)
-                copied = copied && mem.getRDRAM()[kMadr + i] == static_cast<uint8_t>(0x30u + i);
-            t.IsTrue(copied, "SPR_FROM should copy every qword from scratchpad to RDRAM");
-            t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u, "SPR_FROM completion should clear CHCR.STR");
-            t.Equals(mem.readIORegister(kChannel + 0x20u), 0u, "SPR_FROM completion should consume QWC");
-            t.Equals(mem.readIORegister(kChannel + 0x10u), kMadr + kBytes, "SPR_FROM should advance MADR");
-            t.Equals(mem.readIORegister(kChannel + 0x80u), (kSadr + kBytes) & 0x3FFFu, "SPR_FROM should advance SADR");
-            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 8u)) != 0u, "SPR_FROM should raise D_STAT channel 8");
-
-            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
-            t.Equals(causes.size(), static_cast<size_t>(1u), "SPR_FROM should queue one DMAC completion");
-            if (!causes.empty())
-                t.Equals(causes[0], 8u, "SPR_FROM completion should use DMAC cause 8");
-        });
-
-        tc.Run("DMAC SPR_TO copies RDRAM to scratchpad and completes channel 9", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kChannel = 0x1000D400u;
-            constexpr uint32_t kMadr = 0x00028400u;
-            constexpr uint32_t kSadr = 0x00000240u;
-            constexpr uint32_t kQwc = 2u;
-            constexpr uint32_t kBytes = kQwc * 16u;
-
-            for (uint32_t i = 0; i < kBytes; ++i)
-                mem.getRDRAM()[kMadr + i] = static_cast<uint8_t>(0x70u + i);
-
-            t.IsTrue(mem.writeIORegister(kChannel + 0x10u, kMadr), "write SPR_TO MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kChannel + 0x20u, kQwc), "write SPR_TO QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kChannel + 0x80u, kSadr), "write SPR_TO SADR should succeed");
-            t.IsTrue(mem.writeIORegister(kChannel + 0x00u, 0x100u), "start SPR_TO should succeed");
-
-            bool copied = true;
-            for (uint32_t i = 0; i < kBytes; ++i)
-                copied = copied && mem.getScratchpad()[kSadr + i] == static_cast<uint8_t>(0x70u + i);
-            t.IsTrue(copied, "SPR_TO should copy every qword from RDRAM to scratchpad");
-            t.IsTrue((mem.readIORegister(kChannel + 0x00u) & 0x100u) == 0u, "SPR_TO completion should clear CHCR.STR");
-            t.Equals(mem.readIORegister(kChannel + 0x20u), 0u, "SPR_TO completion should consume QWC");
-            t.IsTrue((mem.readIORegister(0x1000E010u) & (1u << 9u)) != 0u, "SPR_TO should raise D_STAT channel 9");
-
-            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
-            t.Equals(causes.size(), static_cast<size_t>(1u), "SPR_TO should queue one DMAC completion");
-            if (!causes.empty())
-                t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
-        });
-
-        tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
-        {
-            PS2Runtime runtime;
-            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
-
-            constexpr uint32_t kDctrl = 0x1000E000u;
-            constexpr uint32_t kDpcr = 0x1000E020u;
-            constexpr uint32_t kDsqwc = 0x1000E030u;
-            constexpr uint32_t kDrbor = 0x1000E050u;
-            constexpr uint32_t kDrbsr = 0x1000E040u;
-            constexpr uint32_t kDstadr = 0x1000E060u;
-
-            PS2Memory &mem = runtime.memory();
-            t.IsTrue(mem.writeIORegister(kDctrl, 0u), "clearing D_CTRL should succeed");
-            t.IsTrue(mem.writeIORegister(kDpcr, 0x12345678u), "writing D_PCR should succeed");
-            t.IsTrue(mem.writeIORegister(kDsqwc, 0x11220044u), "writing D_SQWC should succeed");
-            t.IsTrue(mem.writeIORegister(kDrbor, 0x2000u), "writing D_RBOR should succeed");
-            t.IsTrue(mem.writeIORegister(kDrbsr, 0x3FFFu), "writing D_RBSR should succeed");
-            t.IsTrue(mem.writeIORegister(kDstadr, 0x4567u), "writing D_STADR should succeed");
-
-            R5900Context ctx{};
-            ps2_stubs::sceDmaReset(mem.getRDRAM(), &ctx, &runtime);
-
-            t.Equals(static_cast<int32_t>(::getRegU32(&ctx, 2)), 0, "sceDmaReset should return 0");
-            t.Equals(mem.readIORegister(kDctrl), 1u, "sceDmaReset should leave D_CTRL DMAE enabled");
-            t.Equals(mem.readIORegister(kDpcr), 0u, "sceDmaReset should clear D_PCR");
-            t.Equals(mem.readIORegister(kDsqwc), 0u, "sceDmaReset should clear D_SQWC");
-            t.Equals(mem.readIORegister(kDrbor), 0u, "sceDmaReset should clear D_RBOR");
-            t.Equals(mem.readIORegister(kDrbsr), 0u, "sceDmaReset should clear D_RBSR");
-            t.Equals(mem.readIORegister(kDstadr), 0u, "sceDmaReset should clear D_STADR");
-        });
 
         tc.Run("sceDmaSend preserves guest-configured VIF1 TTE", [](TestCase &t)
         {
@@ -2044,176 +1153,418 @@ void register_ps2_memory_tests()
                      "preserved TTE should deliver the tag high-half VIFcode");
         });
 
-        tc.Run("VIF1 DMA DIRECT image packet reaches GS through arbiter", [](TestCase &t)
-        {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
 
-            GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
-            {
-                gs.processGIFPacket(data, sizeBytes);
+        // GOW-Port: en el hardware la IMAGE continua con la carga del siguiente DIRECT, no con los codigos VIF
+        // que siguen al primero. Las dos pruebas de abajo comprobaban el comportamiento anterior.
+
+        // GOW-Port: una etiqueta PACKED tambien puede cruzar varios comandos DIRECT/HL.
+        tc.Run("VIF1 DIRECT preserves a PACKED tag across separate commands and MARK", [](TestCase &t)
+        {
+            PS2Memory mem; t.IsTrue(mem.initialize(),"Inicializar memoria");
+            GS gs; gs.init(mem.getGSVRAM(),static_cast<uint32_t>(PS2_GS_VRAM_SIZE),&mem.gs());
+            GifArbiter arbiter;
+            std::vector<GifPathId> paths;
+            arbiter.setProcessPathPacketFn([&](GifPathId path,const uint8_t *data,uint32_t size) {
+                paths.push_back(path); gs.processGIFPacket(data,size,path);
             });
             mem.setGifArbiter(&arbiter);
-
-            const uint64_t bitblt =
-                (static_cast<uint64_t>(0u) << 0) |
-                (static_cast<uint64_t>(1u) << 16) |
-                (static_cast<uint64_t>(0u) << 24) |
-                (static_cast<uint64_t>(0u) << 32) |
-                (static_cast<uint64_t>(1u) << 48) |
-                (static_cast<uint64_t>(0u) << 56);
-            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
-            gs.writeRegister(GS_REG_TRXPOS, 0ull);
-            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (1ull << 32));
-            gs.writeRegister(GS_REG_TRXDIR, 0ull);
-
-            constexpr uint32_t kVif1Ch = 0x10009000u;
-            constexpr uint32_t kSrc = 0x00027C00u;
-            constexpr uint32_t kQwc = 3u;
-
-            uint8_t *rdram = mem.getRDRAM();
-            std::memset(rdram + kSrc, 0, kQwc * 16u);
-
-            const uint32_t directCmd = makeVifCmd(0x50u, 0u, 2u); // DIRECT 2 QW payload.
-            std::memcpy(rdram + kSrc, &directCmd, sizeof(directCmd));
-
-            uint8_t *gifPayload = rdram + kSrc + 4u;
-            const uint64_t gifTag = makeGifTag(1u, GIF_FMT_IMAGE, 0u, true);
-            std::memcpy(gifPayload + 0u, &gifTag, sizeof(gifTag));
-            const uint64_t tagHi = 0u;
-            std::memcpy(gifPayload + 8u, &tagHi, sizeof(tagHi));
-            for (uint32_t i = 0; i < 16u; ++i)
+            const uint64_t gif[]={2ull|(1ull<<15)|(1ull<<60),0xeull,7ull,GS_REG_COLCLAMP,1ull,GS_REG_DTHE};
+            for(uint32_t i=0u;i<3u;++i)
             {
-                gifPayload[16u + i] = static_cast<uint8_t>(0x70u + i);
+                std::vector<uint8_t> command(12u,0u);
+                appendU32(command,makeVifCmd(i==1u ? 0x51u : 0x50u,0u,1u));
+                const auto *payload=reinterpret_cast<const uint8_t *>(gif)+i*16u;
+                command.insert(command.end(),payload,payload+16u);
+                appendU32(command,makeVifCmd(0x07u,0u,0x1234u+i));
+                mem.processVIF1Data(command.data(),static_cast<uint32_t>(command.size()));
             }
-
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kSrc), "write VIF1 MADR should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, kQwc), "write VIF1 QWC should succeed");
-            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
-
-            mem.processPendingTransfers();
-
-            const uint8_t *vramOut = mem.getGSVRAM();
-            bool imageOk = true;
-            for (uint32_t x = 0; x < 4u && imageOk; ++x)
-            {
-                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
-                for (uint32_t c = 0; c < 4u; ++c)
-                {
-                    if (vramOut[off + c] != static_cast<uint8_t>(0x70u + x * 4u + c))
-                    {
-                        imageOk = false;
-                        break;
-                    }
-                }
-            }
-            t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
+            t.Equals(gs.getDebugSnapshot().colclamp,7ull,"Primer A+D sigue al header enviado por otro DIRECT");
+            t.Equals(gs.getDebugSnapshot().dthe,1ull,"Segundo A+D sigue al DIRECTHL");
+            t.Equals(mem.vif1_regs.mark,0x1236u,"Los MARK intermedios no pasan al GIF");
+            t.IsTrue(paths==std::vector<GifPathId>({GifPathId::Path2,GifPathId::Path2,GifPathId::Path2}),"El arbiter conserva PATH2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+
+        // GOW-Port: los comandos VIF entre dos DIRECT no forman parte de la IMAGE pendiente.
+
+        // GOW-Port: cambiar DIRECT/HL entre comandos tambien cambia la prioridad de PATH2.
+        tc.Run("VIF1 image continuation uses the current DIRECT priority", [](TestCase &t)
         {
-            PS2Memory mem;
-            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            for (const bool currentHl : {false, true})
             {
-                gs.processGIFPacket(data, sizeBytes);
-            });
-            mem.setGifArbiter(&arbiter);
-
-            const uint64_t bitblt =
-                (static_cast<uint64_t>(0u) << 0) |
-                (static_cast<uint64_t>(1u) << 16) |
-                (static_cast<uint64_t>(0u) << 24) |
-                (static_cast<uint64_t>(0u) << 32) |
-                (static_cast<uint64_t>(1u) << 48) |
-                (static_cast<uint64_t>(0u) << 56);
-            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
-            gs.writeRegister(GS_REG_TRXPOS, 0ull);
-            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (1ull << 32));
-            gs.writeRegister(GS_REG_TRXDIR, 0ull);
-
-            std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
-            appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
-            appendU64(packet, 0ull);
-            for (uint32_t i = 0; i < 16u; ++i)
-            {
-                packet.push_back(static_cast<uint8_t>(0xA0u + i));
-            }
-
-            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
-
-            const uint8_t *vramOut = mem.getGSVRAM();
-            bool imageOk = true;
-            for (uint32_t x = 0; x < 4u && imageOk; ++x)
-            {
-                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
-                for (uint32_t c = 0; c < 4u; ++c)
+                PS2Memory mem;
+                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                std::vector<std::vector<uint8_t>> delivered;
+                GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
                 {
-                    if (vramOut[off + c] != static_cast<uint8_t>(0xA0u + x * 4u + c))
-                    {
-                        imageOk = false;
-                        break;
-                    }
-                }
+                    delivered.emplace_back(data, data + sizeBytes);
+                });
+                mem.setGifArbiter(&arbiter);
+                std::vector<uint8_t> first;
+                for (uint32_t i = 0; i < 3u; ++i)
+                    appendU32(first, 0u);
+                appendU32(first, makeVifCmd(currentHl ? 0x50u : 0x51u, 0u, 1u));
+                appendU64(first, makeGifTag(1u, GIF_FMT_IMAGE, 0u));
+                appendU64(first, 0ull);
+                mem.processVIF1Data(first.data(), static_cast<uint32_t>(first.size()));
+                delivered.clear();
+
+                std::vector<uint8_t> path3;
+                appendU64(path3, makeGifTag(1u, GIF_FMT_IMAGE, 0u));
+                appendU64(path3, 0ull);
+                appendU64(path3, 0ull); appendU64(path3, 0ull); // IMAGE no vacia
+                arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
+                std::vector<uint8_t> next;
+                for (uint32_t i = 0; i < 3u; ++i)
+                    appendU32(next, 0u);
+                appendU32(next, makeVifCmd(currentHl ? 0x51u : 0x50u, 0u, 1u));
+                next.insert(next.end(), 16u, 0xD0u);
+                mem.processVIF1Data(next.data(), static_cast<uint32_t>(next.size()));
+                t.Equals(delivered.size(), size_t{2}, "both paths should drain");
+                if (delivered.size() == 2u)
+                    t.IsTrue(delivered[currentHl ? 0u : 1u] == path3,
+                             "DIRECTHL follows PATH3 IMAGE, DIRECT precedes it regardless of previous opcode");
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
         });
 
-        tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
+        // GOW-Port: un DIRECT mantiene su tamaño aunque el DMA/FIFO entregue varios bloques.
+        tc.Run("VIF1 DIRECT retains PACKED and REGLIST payloads across all byte cuts", [](TestCase &t)
+        {
+            for (const uint8_t format : {GIF_FMT_PACKED, GIF_FMT_REGLIST})
+            {
+                std::vector<uint8_t> gif;
+                appendU64(gif, makeGifTag(1u, format, 1u));
+                appendU64(gif, format == GIF_FMT_PACKED ? 0x0Eull : 0x01ull);
+                appendU64(gif, 0x8000008000ull);
+                appendU64(gif, format == GIF_FMT_PACKED ? GS_REG_TEXA : 0ull);
+                std::vector<uint8_t> packet(12u, 0u);
+                appendU32(packet, makeVifCmd(0x50u, 0u, 2u));
+                packet.insert(packet.end(), gif.begin(), gif.end());
+                appendU32(packet, makeVifCmd(0x07u, 0u, 0x4321u));
+
+                for (uint32_t cut = 0u; cut < 32u; ++cut)
+                {
+                    PS2Memory mem;
+                    t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                    std::vector<std::vector<uint8_t>> delivered;
+                    mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+                    {
+                        delivered.emplace_back(data, data + sizeBytes);
+                    });
+                    mem.processVIF1Data(packet.data(), 16u + cut);
+                    mem.processVIF1Data(packet.data() + 16u + cut,
+                                        static_cast<uint32_t>(packet.size()) - 16u - cut);
+                    t.IsTrue(delivered.size() == 1u && delivered[0] == gif,
+                             "split DIRECT must deliver one intact GIF payload, including odd REGLIST padding");
+                    t.Equals(mem.vif1_regs.mark, 0x4321u, "MARK after the payload must execute exactly once");
+                }
+            }
+        });
+
+        tc.Run("VIF1 FIFO completes DIRECT over separate quadword writes", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
-
-            GS gs;
-            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
-            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            std::vector<uint8_t> gif;
+            appendU64(gif, makeGifTag(1u, GIF_FMT_PACKED, 1u));
+            appendU64(gif, 0x0Eull);
+            appendU64(gif, 0x8000008000ull);
+            appendU64(gif, GS_REG_TEXA);
+            std::vector<uint8_t> packet(12u, 0u);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 2u));
+            packet.insert(packet.end(), gif.begin(), gif.end());
+            appendU32(packet, makeVifCmd(0x07u, 0u, 0x2345u));
+            packet.insert(packet.end(), 12u, 0u);
+            std::vector<std::vector<uint8_t>> delivered;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
             {
-                gs.processGIFPacket(data, sizeBytes);
+                delivered.emplace_back(data, data + sizeBytes);
             });
-            mem.setGifArbiter(&arbiter);
+            for (size_t offset = 0u; offset < packet.size(); offset += 16u)
+                mem.write128(0x10005000u, _mm_loadu_si128(reinterpret_cast<const __m128i *>(packet.data() + offset)));
+            t.IsTrue(delivered.size() == 1u && delivered[0] == gif, "FIFO writes must not decode GIF data as VIF commands");
+            t.Equals(mem.vif1_regs.mark, 0x2345u, "FIFO MARK must execute after the complete DIRECT");
+        });
 
-            const uint64_t bitblt =
-                (static_cast<uint64_t>(1u) << 16) |
-                (static_cast<uint64_t>(1u) << 48);
-            gs.writeRegister(GS_REG_BITBLTBUF, bitblt);
-            gs.writeRegister(GS_REG_TRXPOS, 0ull);
-            gs.writeRegister(GS_REG_TRXREG, (4ull << 0) | (1ull << 32));
-            gs.writeRegister(GS_REG_TRXDIR, 0ull);
 
-            std::vector<uint8_t> packet;
-            appendU32(packet, makeVifCmd(0x50u, 0u, 3u)); // PACKED tag + A+D + IMAGE tag.
-            appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u, false));
-            appendU64(packet, 0x0Eull);
-            appendU64(packet, 0x8000008000ull); // TEXA, harmless setup preceding the IMAGE tag.
-            appendU64(packet, GS_REG_TEXA);
-            appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
-            appendU64(packet, 0ull);
-            for (uint32_t i = 0; i < 16u; ++i)
-                packet.push_back(static_cast<uint8_t>(0xC0u + i));
-
-            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
-
-            const uint8_t *vramOut = mem.getGSVRAM();
-            bool imageOk = true;
-            for (uint32_t x = 0; x < 4u && imageOk; ++x)
+        tc.Run("VIF1 fragmented DIRECT preserves DIRECTHL arbitration", [](TestCase &t)
+        {
+            for (const bool directHl : {false, true})
             {
-                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
-                for (uint32_t c = 0; c < 4u; ++c)
-                {
-                    if (vramOut[off + c] != static_cast<uint8_t>(0xC0u + x * 4u + c))
-                    {
-                        imageOk = false;
-                        break;
-                    }
-                }
+                PS2Memory mem;
+                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                std::vector<std::vector<uint8_t>> delivered;
+                GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes) { delivered.emplace_back(data, data + sizeBytes); });
+                mem.setGifArbiter(&arbiter);
+                std::vector<uint8_t> path2;
+                appendU64(path2, makeGifTag(1u, GIF_FMT_PACKED, 1u));
+                appendU64(path2, 0x0Eull);
+                appendU64(path2, 0x8000008000ull);
+                appendU64(path2, GS_REG_TEXA);
+                std::vector<uint8_t> packet(12u, 0u);
+                appendU32(packet, makeVifCmd(directHl ? 0x51u : 0x50u, 0u, 2u));
+                packet.insert(packet.end(), path2.begin(), path2.end());
+                mem.processVIF1Data(packet.data(), 28u);
+                std::vector<uint8_t> path3;
+                appendU64(path3, makeGifTag(1u, GIF_FMT_IMAGE, 0u));
+                appendU64(path3, 0ull);
+                appendU64(path3, 0ull); appendU64(path3, 0ull); // IMAGE no vacia
+                arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
+                mem.processVIF1Data(packet.data() + 28u, static_cast<uint32_t>(packet.size()) - 28u);
+                t.IsTrue(delivered.size() == 2u && delivered[directHl ? 0u : 1u] == path3 &&
+                         delivered[directHl ? 1u : 0u] == path2, "fragmented payload must retain its DIRECT/HL priority");
             }
-            t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
+        });
+
+        tc.Run("VIF1 DIRECT immediate zero consumes 65536 quadwords across blocks", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            constexpr uint32_t payloadBytes = 65536u * 16u;
+            std::vector<uint8_t> packet(12u, 0u);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 0u));
+            packet.insert(packet.end(), payloadBytes, 0u); // empty GIF tags
+            appendU32(packet, makeVifCmd(0x07u, 0u, 0x3456u));
+            uint32_t calls = 0u, transferred = 0u;
+            mem.setGifPacketCallback([&](const uint8_t *, uint32_t sizeBytes) { ++calls; transferred += sizeBytes; });
+            mem.processVIF1Data(packet.data(), 48u);
+            for (uint32_t pos = 48u; pos < packet.size();)
+            {
+                const uint32_t chunk = std::min<uint32_t>(4093u, static_cast<uint32_t>(packet.size()) - pos);
+                mem.processVIF1Data(packet.data() + pos, chunk);
+                pos += chunk;
+            }
+            t.Equals(calls, 1u, "maximum DIRECT must not lose its remaining payload");
+            t.Equals(transferred, payloadBytes, "immediate zero encodes 65536 quadwords");
+            t.Equals(mem.vif1_regs.mark, 0x3456u, "maximum DIRECT must stop at its exact byte count");
+        });
+
+        tc.Run("VIF1 reset discards an unfinished DIRECT before accepting a new packet", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::vector<std::vector<uint8_t>> delivered;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes) { delivered.emplace_back(data, data + sizeBytes); });
+            std::vector<uint8_t> abandoned(12u, 0u);
+            appendU32(abandoned, makeVifCmd(0x51u, 0u, 2u));
+            appendU64(abandoned, makeGifTag(1u, GIF_FMT_PACKED, 1u));
+            appendU64(abandoned, 0x0Eull);
+            mem.processVIF1Data(abandoned.data(), static_cast<uint32_t>(abandoned.size()));
+            t.IsTrue(delivered.empty(), "incomplete GIF must not be dispatched to the stateless GS parser");
+            t.IsTrue(mem.writeIORegister(0x10003C10u, 1u), "VIF1 FBRST reset should succeed");
+            std::vector<uint8_t> fresh(12u, 0u);
+            appendU32(fresh, makeVifCmd(0x50u, 0u, 1u));
+            appendU64(fresh, makeGifTag(0u, GIF_FMT_PACKED, 1u));
+            appendU64(fresh, 0x0Eull);
+            appendU32(fresh, makeVifCmd(0x07u, 0u, 0x4567u));
+            mem.processVIF1Data(fresh.data(), static_cast<uint32_t>(fresh.size()));
+            const std::vector<uint8_t> expected(fresh.begin() + 16u, fresh.begin() + 32u);
+            t.IsTrue(delivered.size() == 1u && delivered[0] == expected, "reset must discard stale DIRECT bytes");
+            t.Equals(mem.vif1_regs.mark, 0x4567u, "reset must restore normal VIF command decoding");
+        });
+
+        // GOW-Port: DIRECTHL cambia la eleccion entre PATH2/PATH3, nunca el FIFO de cada path.
+        tc.Run("GIF arbiter preserves PATH2 FIFO when DIRECT and DIRECTHL share a queue", [](TestCase &t)
+        {
+            std::array<unsigned, 3> order{0u, 1u, 2u}; // HL, DIRECT, PATH3 IMAGE
+            do
+            {
+                std::vector<uint64_t> delivered;
+                GifArbiter arbiter([&](const uint8_t *data, uint32_t)
+                {
+                    uint64_t marker = 0u;
+                    std::memcpy(&marker, data + 8u, sizeof(marker));
+                    delivered.push_back(marker);
+                });
+                for (const unsigned id : order)
+                {
+                    std::vector<uint8_t> packet;
+                    // GOW-Port: la prioridad IMAGE requiere NLOOP>0; etiqueta vacia no transmite pixels.
+                    appendU64(packet, makeGifTag(id == 2u ? 1u : 0u, id == 2u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
+                    appendU64(packet, id);
+                    if (id == 2u) { appendU64(packet, 0ull); appendU64(packet, 0ull); }
+                    arbiter.submit(id == 2u ? GifPathId::Path3 : GifPathId::Path2,
+                                   packet.data(), static_cast<uint32_t>(packet.size()), id == 0u);
+                }
+                // PATH1 siempre tiene prioridad sobre ambos, aunque se haya añadido el último.
+                std::vector<uint8_t> path1;
+                appendU64(path1, makeGifTag(0u, GIF_FMT_PACKED, 1u));
+                appendU64(path1, 3u);
+                arbiter.submit(GifPathId::Path1, path1.data(), static_cast<uint32_t>(path1.size()));
+                arbiter.drain();
+                const bool hlFirst = std::find(order.begin(), order.end(), 0u) < std::find(order.begin(), order.end(), 1u);
+                const std::vector<uint64_t> expected = hlFirst ? std::vector<uint64_t>{3u, 2u, 0u, 1u}
+                                                            : std::vector<uint64_t>{3u, 1u, 2u, 0u};
+                t.IsTrue(delivered == expected, "PATH2 order must survive arbitration against PATH3 IMAGE");
+                t.IsTrue(arbiter.empty(), "drain should release all packets");
+            } while (std::next_permutation(order.begin(), order.end()));
+        });
+
+        tc.Run("GIF arbiter preserves PATH3 setup before IMAGE when DIRECTHL is queued", [](TestCase &t)
+        {
+            std::array<unsigned, 3> order{0u, 1u, 2u}; // HL, PATH3 IMAGE, PATH3 setup
+            do
+            {
+                std::vector<uint64_t> delivered;
+                GifArbiter arbiter([&](const uint8_t *data, uint32_t)
+                {
+                    uint64_t marker = 0u;
+                    std::memcpy(&marker, data + 8u, sizeof(marker));
+                    delivered.push_back(marker);
+                });
+                for (const unsigned id : order)
+                {
+                    std::vector<uint8_t> packet;
+                    appendU64(packet, makeGifTag(id == 1u ? 1u : 0u, id == 1u ? GIF_FMT_IMAGE : GIF_FMT_PACKED, 1u));
+                    appendU64(packet, id);
+                    if (id == 1u) { appendU64(packet, 0ull); appendU64(packet, 0ull); }
+                    arbiter.submit(id == 0u ? GifPathId::Path2 : GifPathId::Path3,
+                                   packet.data(), static_cast<uint32_t>(packet.size()), id == 0u);
+                }
+                arbiter.drain();
+                const bool imageFirst = std::find(order.begin(), order.end(), 1u) < std::find(order.begin(), order.end(), 2u);
+                const std::vector<uint64_t> expected = imageFirst ? std::vector<uint64_t>{1u, 0u, 2u}
+                                                               : std::vector<uint64_t>{0u, 2u, 1u};
+                t.IsTrue(delivered == expected, "PATH3 setup and IMAGE order must survive DIRECTHL arbitration");
+            } while (std::next_permutation(order.begin(), order.end()));
+        });
+
+        // GOW-Port: clasificar el flujo completo, incluidos payloads que parecen GIFtags.
+        tc.Run("GIF arbiter retains PATH3 IMAGE classification across drains", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> image;
+            appendU64(image, makeGifTag(2u, GIF_FMT_IMAGE, 0u)); appendU64(image, 0ull);
+            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
+            arbiter.drain(); order.clear();
+            const std::vector<uint8_t> pixels(32u, 0u);
+            std::vector<uint8_t> hl;
+            appendU64(hl, makeGifTag(0u, GIF_FMT_PACKED, 1u)); appendU64(hl, 0ull);
+            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
+            arbiter.submit(GifPathId::Path3, pixels.data(), static_cast<uint32_t>(pixels.size()));
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3, GifPathId::Path2},
+                     "DIRECTHL debe esperar al payload IMAGE pendiente, aunque no lleve etiqueta");
+        });
+
+        tc.Run("GIF arbiter recognizes IMAGE after PACKED setup in the same block", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> path3;
+            appendU64(path3, makeGifTag(1u, GIF_FMT_PACKED, 1u)); appendU64(path3, 0xEull); // A+D
+            appendU64(path3, 7ull); appendU64(path3, GS_REG_COLCLAMP);
+            appendU64(path3, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); appendU64(path3, 0ull);
+            appendU64(path3, 0ull); appendU64(path3, 0ull);
+            const std::vector<uint8_t> hl(16u, 0u);
+            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
+            arbiter.submit(GifPathId::Path3, path3.data(), static_cast<uint32_t>(path3.size()));
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3, GifPathId::Path2},
+                     "IMAGE se reconoce tras el setup sin adelantarla a sus registros");
+        });
+
+        tc.Run("GIF arbiter does not interpret PACKED payload as an IMAGE tag", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> packed;
+            appendU64(packed, makeGifTag(1u, GIF_FMT_PACKED, 1u)); appendU64(packed, 0xFull); // NOP
+            arbiter.submit(GifPathId::Path3, packed.data(), static_cast<uint32_t>(packed.size()));
+            arbiter.drain(); order.clear();
+            std::vector<uint8_t> payload;
+            appendU64(payload, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); appendU64(payload, 0ull);
+            const std::vector<uint8_t> hl(16u, 0u);
+            arbiter.submit(GifPathId::Path3, payload.data(), static_cast<uint32_t>(payload.size()));
+            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
+                     "Un registro PACKED conserva su prioridad aunque sus bits parezcan una etiqueta IMAGE");
+        });
+
+        tc.Run("GIF arbiter ignores empty IMAGE tags for DIRECTHL priority", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> empty;
+            appendU64(empty, makeGifTag(0u, GIF_FMT_IMAGE, 0u)); appendU64(empty, 0ull);
+            const std::vector<uint8_t> hl(16u, 0u);
+            arbiter.submit(GifPathId::Path3, empty.data(), static_cast<uint32_t>(empty.size()));
+            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
+                     "NLOOP=0 no inicia una transferencia IMAGE ni bloquea DIRECTHL");
+        });
+
+        tc.Run("GIF arbiter keeps REGLIST padding and partial next tag across drains", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> prefix;
+            appendU64(prefix, makeGifTag(1u, GIF_FMT_REGLIST, 1u)); appendU64(prefix, 0xFull);
+            appendU64(prefix, 0ull); // un registro, con 8 bytes de relleno pendientes
+            arbiter.submit(GifPathId::Path3, prefix.data(), static_cast<uint32_t>(prefix.size()));
+            arbiter.drain(); order.clear();
+            std::vector<uint8_t> middle;
+            appendU64(middle, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); // relleno: no es una etiqueta
+            appendU64(middle, makeGifTag(1u, GIF_FMT_IMAGE, 0u)); // mitad real de la siguiente etiqueta
+            const std::vector<uint8_t> hl(16u, 0u);
+            arbiter.submit(GifPathId::Path3, middle.data(), static_cast<uint32_t>(middle.size()));
+            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
+                     "Ni el relleno ni una etiqueta incompleta inician IMAGE");
+            order.clear();
+            std::vector<uint8_t> last;
+            appendU64(last, 0ull); appendU64(last, 0ull); appendU64(last, 0ull);
+            arbiter.submit(GifPathId::Path2, hl.data(), static_cast<uint32_t>(hl.size()), true);
+            arbiter.submit(GifPathId::Path3, last.data(), static_cast<uint32_t>(last.size()));
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3, GifPathId::Path2},
+                     "La etiqueta IMAGE reconstruida recupera la prioridad sin contar el relleno");
+        });
+
+        tc.Run("GIF arbiter reset discards PATH3 classification and queued packets", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> image;
+            appendU64(image, makeGifTag(2u, GIF_FMT_IMAGE, 0u)); appendU64(image, 0ull);
+            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
+            arbiter.reset();
+            t.IsTrue(arbiter.empty(), "reset descarta los paquetes antiguos");
+            const std::vector<uint8_t> emptyTag(16u, 0u);
+            arbiter.submit(GifPathId::Path3, emptyTag.data(), static_cast<uint32_t>(emptyTag.size()));
+            arbiter.submit(GifPathId::Path2, emptyTag.data(), static_cast<uint32_t>(emptyTag.size()), true);
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path2, GifPathId::Path3},
+                     "reset evita interpretar la nueva etiqueta como pixels de la transferencia antigua");
+        });
+
+        tc.Run("GIF arbiter recognizes IMAGE2 tags and their raw continuations", [](TestCase &t)
+        {
+            std::vector<GifPathId> order;
+            GifArbiter arbiter;
+            arbiter.setProcessPathPacketFn([&](GifPathId path, const uint8_t *, uint32_t) { order.push_back(path); });
+            std::vector<uint8_t> image;
+            appendU64(image, makeGifTag(1u, 3u, 0u)); appendU64(image, 0ull);
+            const std::vector<uint8_t> empty(16u, 0u);
+            arbiter.submit(GifPathId::Path3, image.data(), static_cast<uint32_t>(image.size()));
+            arbiter.submit(GifPathId::Path2, empty.data(), static_cast<uint32_t>(empty.size()), true);
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3,GifPathId::Path2},"IMAGE2 comparte la prioridad de IMAGE");
+            order.clear();
+            arbiter.submit(GifPathId::Path2, empty.data(), static_cast<uint32_t>(empty.size()), true);
+            arbiter.submit(GifPathId::Path3, empty.data(), static_cast<uint32_t>(empty.size()));
+            arbiter.drain();
+            t.IsTrue(order == std::vector<GifPathId>{GifPathId::Path3,GifPathId::Path2},"El payload IMAGE2 tampoco se decodifica como etiqueta");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)

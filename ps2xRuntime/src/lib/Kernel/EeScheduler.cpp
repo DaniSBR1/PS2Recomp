@@ -1,6 +1,7 @@
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
+#include "runtime/ps2_perf.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
@@ -53,6 +54,7 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+    constexpr uint64_t kPaceSteps = 16u; // pacing points per field (see VBlankStart)
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -154,6 +156,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
 
 void EeScheduler::run()
 {
+    ps2_perf::Scope perf(ps2_perf::Bucket::Ee); // GOW-Port: tiempos exclusivos del ejecutor.
     assertExecutor();
     m_running.store(true, std::memory_order_release);
 
@@ -296,12 +299,16 @@ void EeScheduler::run()
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            ps2_perf::guestEntry(context.pc, m_rdram);
+            loadSharedVu0Random(context);
             function(m_rdram, &context, &m_runtime);
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
@@ -398,6 +405,32 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+uint64_t EeScheduler::catchUpToHost(uint64_t maxCycles) noexcept
+{
+    uint64_t target = 0u;
+    {
+        std::lock_guard lock(m_eventMutex);
+        const auto now = std::chrono::steady_clock::now();
+        for (const ScheduledEvent &item : m_deadlines)
+        {
+            if (item.hostDeadline <= now && item.deadlineCycle > m_eeCycle && item.deadlineCycle > target)
+                target = item.deadlineCycle; // the latest event that is already due on the host clock
+        }
+    }
+    if (target <= m_eeCycle)
+        return 0u;
+    uint64_t missing = std::min(target - m_eeCycle, maxCycles);
+    const uint64_t added = missing;
+    while (missing != 0u)
+    {
+        const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(missing, 0x40000000u));
+        accountCycles(step);
+        missing -= step;
+    }
+    m_checkpointPending.store(true, std::memory_order_release);
+    return added;
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept
@@ -1081,6 +1114,19 @@ int EeScheduler::setAlarm(uint16_t ticks,
     return id;
 }
 
+void EeScheduler::delayCurrent(uint64_t cycles)
+{
+    assertExecutor();
+    // A wake-up event at the deadline, like the timer alarm the guest's DelayThread used. The token names this one
+    // wait (deadline + thread), so a stale event of an earlier, released delay cannot wake a later one.
+    constexpr uint32_t kDelayWaitType = 2u;
+    const uint64_t deadline = m_eeCycle + std::max<uint64_t>(1u, cycles);
+    const uint64_t token = (deadline << 8) | static_cast<uint64_t>(m_currentThreadId & 0xFF);
+    scheduleEvent(deadline, std::chrono::steady_clock::now() + eeCyclesToHostDuration(deadline - m_eeCycle),
+                  EeEvent{EeEventType::ExternalWake, kDelayWaitType, token});
+    waitExternal(EeWaitReason::External, kDelayWaitType, token);
+}
+
 int EeScheduler::cancelAlarm(int id)
 {
     assertExecutor();
@@ -1638,8 +1684,10 @@ void EeScheduler::makeRunning(GuestThread &item)
     renewTimeSlice();
 }
 
+void gowDumpBranchRing(const char *why);
 void EeScheduler::makeDormant(GuestThread &item)
 {
+    { static int n = 0; if (item.id == 1 && n++ < 1) gowDumpBranchRing("main thread dormant"); }
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;
@@ -1740,6 +1788,31 @@ void EeScheduler::applyPendingPreemption()
     m_timeSliceExpired = false;
 }
 
+namespace
+{
+    // GOW-Port: estado del flanco de la interrupcion del GS (solo se usa en el hilo ejecutor). Se guarda
+    // aqui y no en EeScheduler para no cambiar el tamano de la clase.
+    uint32_t g_gsIrqLatched = 0u;
+}
+
+void EeScheduler::pollGsInterrupt()
+{
+    // GOW-Port: el runtime marcaba CSR.FINISH/SIGNAL pero nunca lanzaba la interrupcion del GS (INTC 0).
+    // God of War espera el fin de cada cadena DMA con un manejador de esa interrupcion
+    // (vid::WaitForDMAComplete se queda esperando una bandera que solo pone ese manejador).
+    // IMR: bit 8 = SIGMSK, bit 9 = FINISHMSK (1 = enmascarada). El manejador borra el bit escribiendo CSR.
+    auto &gs = m_runtime.memory().gs();
+    const uint32_t csr = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+    const uint32_t masked = static_cast<uint32_t>(gs.imr >> 8) & 0x3u;
+    const uint32_t active = csr & ~masked;
+    const uint32_t rising = active & ~g_gsIrqLatched;
+    g_gsIrqLatched = active;
+    if (rising != 0u)
+    {
+        dispatchIrq(false, 0u);
+    }
+}
+
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
@@ -1753,6 +1826,7 @@ void EeScheduler::processPendingEvents()
             dispatchIrq(false, 9u + timer);
         }
     }
+    pollGsInterrupt();
     std::deque<EeEvent> pending;
     {
         std::lock_guard lock(m_eventMutex);
@@ -1800,6 +1874,8 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                // GOW-Port: sleeping until the host VBlank/timer deadline is waiting, not EE work (ee_ms).
+                ps2_perf::Scope waitPerf(ps2_perf::Bucket::GuestWait);
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
@@ -1847,12 +1923,39 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // GOW-Port: GOW_VBLANK_DIAG=1 prints the guest VBlank rate and how far the host deadline lags
+                // behind the wall clock (a lag means VBlanks are cycle-paced and can run faster than 60 Hz).
+                static const bool vblankDiag = std::getenv("GOW_VBLANK_DIAG") != nullptr;
+                if (vblankDiag)
+                {
+                    static uint64_t count = 0;
+                    static auto windowStart = std::chrono::steady_clock::now();
+                    ++count;
+                    const auto wall = std::chrono::steady_clock::now();
+                    const double secs = std::chrono::duration<double>(wall - windowStart).count();
+                    if (secs >= 5.0)
+                    {
+                        std::fprintf(stderr, "[vblank-diag] rate=%.2f Hz host_lag_ms=%.1f\n", count / secs,
+                                     std::chrono::duration<double, std::milli>(wall - scheduled.hostDeadline).count());
+                        count = 0;
+                        windowStart = wall;
+                    }
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
                               scheduled.hostDeadline + kVBlankPeriod,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
+                // GOW-Port: pacing points on the VBlank grid (cycle and host deadline in lockstep, no-op event). The
+                // guest clock may not run ahead of the wall clock by more than 1/16 field inside a frame: recompiled
+                // busy-waits (vid::WaitForDMAComplete polling the GS-done flag) otherwise burn guest cycles ~10x
+                // faster than real time, the FINISH and the game's frame-clock read land late in guest time and its
+                // frame step (>= 1 field) ran 3 % fast at 60 fps (docs/performance.md, game speed).
+                for (uint64_t k = 1; k < kPaceSteps; ++k)
+                    scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles * k / kPaceSteps,
+                                  scheduled.hostDeadline + kVBlankPeriod * k / kPaceSteps,
+                                  EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
             }
             processEvent(scheduled.event);
         }
@@ -1996,6 +2099,7 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
 
 void EeScheduler::waitForEvent()
 {
+    ps2_perf::Scope perf(ps2_perf::Bucket::GuestWait);
     std::unique_lock lock(m_eventMutex);
     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
     {
@@ -2111,6 +2215,22 @@ void EeScheduler::copyMainContextToRuntime()
     {
         m_runtime.m_cpuContext = main->context;
     }
+}
+
+void EeScheduler::loadSharedVu0Random(R5900Context &context)
+{
+    if (!m_sharedVu0RandomValid)
+    {
+        saveSharedVu0Random(context);
+        return;
+    }
+    context.vu0_r = m_sharedVu0Random;
+}
+
+void EeScheduler::saveSharedVu0Random(const R5900Context &context)
+{
+    m_sharedVu0Random = context.vu0_r;
+    m_sharedVu0RandomValid = true;
 }
 
 void EeScheduler::publishDebugContext(const R5900Context &context)

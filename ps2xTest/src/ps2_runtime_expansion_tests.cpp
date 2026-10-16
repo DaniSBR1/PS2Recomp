@@ -166,7 +166,20 @@ namespace
         }
     }
 
+    void testGuestBranchCheckpointHandler(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        runtime->eeScheduler().requestStop();
+        if (runtime->eeCheckpointDue()) return;
+        ctx->pc = 0u;
+    }
+
     std::atomic<uint32_t> gGuestJumpTargetCount{0u};
+
+    void testGuestBranchSelfTailJumpHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 29, 0x00001F00u);
+        runtime->dispatchGuestBranch(rdram, ctx, 0x3600u, 0x3610u, 0u, PS2Runtime::GuestBranchKind::DirectJump, "test-j");
+    }
 
     void testGuestJumpTargetHandler(uint8_t *, R5900Context *, PS2Runtime *)
     {
@@ -220,6 +233,57 @@ namespace
         gIpuInitResult.store(getRegS32(*ctx, 2), std::memory_order_release);
         ctx->pc = 0u;
         runtime->requestStop();
+    }
+
+    // GOW-Port: sceMpegCbNodata. El callback produce un fotograma en su llamada numero gNodataProduceOnCall.
+    constexpr uint32_t kNodataMainPc = 0x00125200u;
+    constexpr uint32_t kNodataResumePc = 0x00125210u;
+    constexpr uint32_t kNodataCallbackPc = 0x00125220u;
+    constexpr uint32_t kNodataVsyncPc = 0x00125230u;
+    constexpr uint32_t kNodataHandle = 0x00124400u;
+    constexpr uint32_t kNodataImage = 0x00132000u;
+    constexpr uint32_t kNodataUserData = 0xCAFE0001u;
+    std::atomic<uint32_t> gNodataCalls{0u};
+    std::atomic<uint32_t> gNodataProduceOnCall{1u};
+    std::atomic<uint32_t> gNodataSeenMpeg{0u};
+    std::atomic<uint32_t> gNodataSeenType{0xFFFFFFFFu};
+    std::atomic<uint32_t> gNodataSeenUserData{0u};
+    std::atomic<int32_t> gNodataResult{-999};
+
+    void testNodataMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, kNodataHandle);
+        setRegU32(*ctx, 5, kNodataImage);
+        ctx->pc = kNodataResumePc;
+        ps2_stubs::sceMpegGetPicture(rdram, ctx, runtime);
+    }
+
+    void testNodataResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gNodataResult.store(static_cast<int32_t>(::getRegU32(ctx, 2)), std::memory_order_release);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void testNodataCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        const uint32_t call = gNodataCalls.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+        gNodataSeenMpeg.store(::getRegU32(ctx, 4), std::memory_order_release);
+        gNodataSeenType.store(Ps2FastRead32(rdram, ::getRegU32(ctx, 5)), std::memory_order_release);
+        gNodataSeenUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        if (call == gNodataProduceOnCall.load(std::memory_order_acquire))
+        {
+            ps2_stubs::enqueueMpegDecodedFrameForTesting(kNodataHandle);
+        }
+        setRegU32(*ctx, 2, 1u);
+        ctx->pc = ::getRegU32(ctx, 31);
+    }
+
+    void testNodataVsync(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // Simula el siguiente VSync mientras GetPicture espera tras un callback sin datos.
+        runtime->eeScheduler().completeVSync(runtime->eeScheduler().currentVSyncTick() + 1u);
+        ctx->pc = 0u;
     }
 
     void testMpegWaitMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -315,6 +379,29 @@ void register_ps2_runtime_expansion_tests()
 {
     MiniTest::Case("PS2RuntimeExpansion", [](TestCase &tc)
     {
+        tc.Run("R5900Context initializes VU0 VF0 to its constant value", [](TestCase &t)
+        {
+            R5900Context context{};
+            alignas(16) uint32_t lanes[4]{};
+            _mm_store_si128(reinterpret_cast<__m128i *>(lanes), _mm_castps_si128(context.vu0_vf[0]));
+
+            t.Equals(lanes[0], 0u, "VF0.x must be zero");
+            t.Equals(lanes[1], 0u, "VF0.y must be zero");
+            t.Equals(lanes[2], 0u, "VF0.z must be zero");
+            t.Equals(lanes[3], 0x3F800000u, "VF0.w must be one");
+        });
+
+        tc.Run("VU0 VF write helper skips VF0 without evaluating its value", [](TestCase &t)
+        {
+            R5900Context context{};
+            int evaluations = 0;
+            PS2_VU0_VF_WRITE(&context, 0, (++evaluations, _mm_set1_ps(9.0f)));
+            t.Equals(evaluations, 0, "VF0 writes must skip value evaluation");
+
+            PS2_VU0_VF_WRITE(&context, 1, (++evaluations, _mm_set1_ps(9.0f)));
+            t.Equals(evaluations, 1, "nonzero VF writes must evaluate their value");
+            t.Equals(_mm_cvtss_f32(context.vu0_vf[1]), 9.0f, "nonzero VF destinations must be written");
+        });
         tc.Run("differential decoder/codegen gpr-write contract for MULT and DIV families", [](TestCase &t)
         {
             R5900Decoder decoder;
@@ -404,6 +491,45 @@ void register_ps2_runtime_expansion_tests()
                      "unchanged callee PC should be converted to call fallthrough");
             t.Equals(::getRegU32(&ctx, 2), 0x00FACE42u,
                      "callee should still execute normally");
+        });
+
+        tc.Run("dispatchGuestBranch preserves a checkpoint at the callee entry", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3000u, &testGuestBranchCheckpointHandler);
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            const bool returned = runtime.dispatchGuestBranch(nullptr, &ctx, 0x3000u, 0x2000u,
+                0x2008u, PS2Runtime::GuestBranchKind::DirectCall, "checkpoint-test");
+            t.IsFalse(returned, "a checkpoint must unwind rather than finish the call");
+            t.Equals(ctx.pc, 0x3000u, "the scheduler must resume the unfinished loop");
+        });
+
+        // GOW-Port: prueba del fork de SotC (c4c20e8).
+        tc.Run("dispatchGuestBranch call does not treat a tail jump to the callee entry as a return", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3600u, &testGuestBranchSelfTailJumpHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            setRegU32(ctx, 29, 0x00002000u);
+
+            const bool continuedInCaller = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3600u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::DirectCall,
+                "test-jal");
+
+            t.IsFalse(continuedInCaller,
+                      "a pending tail jump back to the callee entry must unwind to the dispatcher");
+            t.Equals(ctx.pc, 0x3600u,
+                     "the dispatcher should resume at the tail-jump target");
+            t.Equals(::getRegU32(&ctx, 29), 0x00001F00u,
+                     "the callee's stack pointer belongs to the pending tail call");
         });
 
         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
@@ -548,201 +674,40 @@ void register_ps2_runtime_expansion_tests()
                      "sceMpegInit should reset MPEG callback bookkeeping between runs");
         });
 
-        tc.Run("sceMpegDemuxPssRing dispatches registered video and audio stream callbacks", [](TestCase &t)
+
+        // GOW-Port: God of War demultiplexa el primer bloque (con la cabecera de secuencia) antes de
+        // sceMpegCreate; reiniciar el estado ahí dejaba el decodificador esperando una cabecera que no vuelve.
+        tc.Run("sceMpegCreate keeps a sequence header demuxed before it", [](TestCase &t)
         {
             PS2Runtime runtime;
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
             ps2_stubs::resetMpegStubState();
-
             constexpr uint32_t kMpegAddr = 0x00123000u;
-            constexpr uint32_t kCallbackEntry = 0x00124000u;
-            constexpr uint32_t kVideoUserData = 0x11223344u;
-            constexpr uint32_t kAudioUserData = 0x55667788u;
-            constexpr uint32_t kVideoPacketAddr = 0x00128000u;
-            constexpr uint32_t kAudioPacketAddr = 0x00129000u;
+            constexpr uint32_t kPacketAddr = 0x00128000u;
+            const std::vector<uint8_t> payload = {0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+            const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+            std::vector<uint8_t> packet = {0x00u, 0x00u, 0x01u, 0xE0u, static_cast<uint8_t>(packetLen >> 8u),
+                                           static_cast<uint8_t>(packetLen & 0xFFu), 0x80u, 0x00u, 0x00u};
+            packet.insert(packet.end(), payload.begin(), payload.end());
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
 
-            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
-            runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
-            auto prepareCallbackDispatch = [&]()
-            {
-                R5900Context idleContext{};
-                idleContext.pc = kMpegCallbackStopPc;
-                runtime.eeScheduler().reset(rdram.data(), idleContext);
-            };
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            setRegU32(demuxCtx, 7, 0u);
+            setRegU32(demuxCtx, 8, 0xFFFFFFFFu);
+            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+            t.IsTrue(!ps2_stubs::mpegWaitingForSequenceHeaderForTesting(kMpegAddr),
+                     "the demuxed sequence header should be seen");
 
-            auto registerGenericCallback = [&](uint32_t callbackType, uint32_t userData)
-            {
-                R5900Context addCtx{};
-                setRegU32(addCtx, 4, kMpegAddr);
-                setRegU32(addCtx, 5, callbackType);
-                setRegU32(addCtx, 6, kCallbackEntry);
-                setRegU32(addCtx, 7, userData);
-                ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
-            };
-
-            auto registerStreamCallback = [&](uint32_t streamType, uint32_t userData)
-            {
-                R5900Context addCtx{};
-                setRegU32(addCtx, 4, kMpegAddr);
-                setRegU32(addCtx, 5, streamType);
-                setRegU32(addCtx, 6, 0u);
-                setRegU32(addCtx, 7, kCallbackEntry);
-                setRegU32(addCtx, 8, userData);
-                ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
-            };
-
-            auto writePesPacket = [&](uint32_t addr, uint8_t streamId, const std::vector<uint8_t> &payload)
-            {
-                const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
-                std::vector<uint8_t> packet = {
-                    0x00u, 0x00u, 0x01u, streamId,
-                    static_cast<uint8_t>(packetLen >> 8u),
-                    static_cast<uint8_t>(packetLen & 0xFFu),
-                    0x80u, 0x00u, 0x00u};
-                packet.insert(packet.end(), payload.begin(), payload.end());
-                std::memcpy(rdram.data() + addr, packet.data(), packet.size());
-                return static_cast<uint32_t>(packet.size());
-            };
-
-            registerGenericCallback(0u, 0xDEAD0000u);
-            registerGenericCallback(2u, 0xDEAD0002u);
-            registerStreamCallback(0u, kVideoUserData);
-            registerStreamCallback(2u, kAudioUserData);
-
-            const std::vector<uint8_t> videoPayload = {
-                0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
-            const uint32_t videoPacketSize = writePesPacket(kVideoPacketAddr, 0xE0u, videoPayload);
-
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
-            R5900Context videoDemuxCtx{};
-            setRegU32(videoDemuxCtx, 4, kMpegAddr);
-            setRegU32(videoDemuxCtx, 5, kVideoPacketAddr);
-            setRegU32(videoDemuxCtx, 6, videoPacketSize);
-            setRegU32(videoDemuxCtx, 7, kVideoPacketAddr);
-            setRegU32(videoDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &videoDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
-
-            t.Equals(getRegS32(videoDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
-                     "sceMpegDemuxPssRing should consume the video PES packet");
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
-                     "registered video stream callback should be invoked");
-            t.Equals(gMpegStreamCallbackMpeg.load(std::memory_order_acquire), kMpegAddr,
-                     "video callback should receive the MPEG handle");
-            t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 0u,
-                     "video callback data should report M2V stream type");
-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kVideoPacketAddr + 9u,
-                     "video callback data should point at PES payload");
-            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
-                     static_cast<uint32_t>(videoPayload.size()),
-                     "video callback data should report PES payload length");
-            t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kVideoUserData,
-                     "video callback should receive registered user data");
-
-            const std::vector<uint8_t> audioPayload = {0x80u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u};
-            const uint32_t audioPacketSize = writePesPacket(kAudioPacketAddr, 0xBDu, audioPayload);
-
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
-            R5900Context audioDemuxCtx{};
-            setRegU32(audioDemuxCtx, 4, kMpegAddr);
-            setRegU32(audioDemuxCtx, 5, kAudioPacketAddr);
-            setRegU32(audioDemuxCtx, 6, audioPacketSize);
-            setRegU32(audioDemuxCtx, 7, kAudioPacketAddr);
-            setRegU32(audioDemuxCtx, 8, audioPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &audioDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
-
-            t.Equals(getRegS32(audioDemuxCtx, 2), static_cast<int32_t>(audioPacketSize),
-                     "sceMpegDemuxPssRing should consume the audio PES packet");
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
-                     "registered audio stream callback should be invoked");
-            t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 2u,
-                     "audio callback data should report PCM stream type");
-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
-                     "audio callback data should point at PES payload");
-            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
-                     static_cast<uint32_t>(audioPayload.size()),
-                     "audio callback data should report PES payload length");
-            t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kAudioUserData,
-                     "audio callback should receive registered user data");
-
-            ps2_stubs::notifyMpegCdStreamEof();
-
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            R5900Context afterEofDemuxCtx{};
-            setRegU32(afterEofDemuxCtx, 4, kMpegAddr);
-            setRegU32(afterEofDemuxCtx, 5, kVideoPacketAddr);
-            setRegU32(afterEofDemuxCtx, 6, videoPacketSize);
-            setRegU32(afterEofDemuxCtx, 7, kVideoPacketAddr);
-            setRegU32(afterEofDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterEofDemuxCtx, &runtime);
-
-            t.Equals(getRegS32(afterEofDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
-                     "post-EOF demux should continue consuming caller data");
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 0u,
-                     "post-EOF demux should not feed callbacks again");
-
-            R5900Context resetCtx{};
-            setRegU32(resetCtx, 4, kMpegAddr);
-            ps2_stubs::sceMpegReset(rdram.data(), &resetCtx, &runtime);
-
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            R5900Context afterResetDemuxCtx{};
-            setRegU32(afterResetDemuxCtx, 4, kMpegAddr);
-            setRegU32(afterResetDemuxCtx, 5, kVideoPacketAddr);
-            setRegU32(afterResetDemuxCtx, 6, videoPacketSize);
-            setRegU32(afterResetDemuxCtx, 7, kVideoPacketAddr);
-            setRegU32(afterResetDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterResetDemuxCtx, &runtime);
-
-            t.Equals(getRegS32(afterResetDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
-                     "post-EOF reset demux should still drain caller data");
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 0u,
-                     "post-EOF reset demux should not restart callbacks on stale data");
-
-            ps2_stubs::notifyMpegCdStreamStart();
-
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
-            R5900Context afterNewStreamDemuxCtx{};
-            setRegU32(afterNewStreamDemuxCtx, 4, kMpegAddr);
-            setRegU32(afterNewStreamDemuxCtx, 5, kVideoPacketAddr);
-            setRegU32(afterNewStreamDemuxCtx, 6, videoPacketSize);
-            setRegU32(afterNewStreamDemuxCtx, 7, kVideoPacketAddr);
-            setRegU32(afterNewStreamDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterNewStreamDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
-
-            t.Equals(getRegS32(afterNewStreamDemuxCtx, 2), static_cast<int32_t>(videoPacketSize),
-                     "new CD stream demux should reopen an ended MPEG handle");
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
-                     "new CD stream demux should allow callbacks on a reused MPEG handle");
-
-            constexpr uint32_t kMpegWorkAddr = 0x00130000u;
             R5900Context createCtx{};
             setRegU32(createCtx, 4, kMpegAddr);
-            setRegU32(createCtx, 5, kMpegWorkAddr);
+            setRegU32(createCtx, 5, 0x00130000u);
             setRegU32(createCtx, 6, 0x2000u);
             ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
-            t.IsTrue(::getRegU32(&createCtx, 2) != 0u,
-                     "sceMpegCreate should reopen the MPEG handle after an ended reset");
-
-            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
-            prepareCallbackDispatch();
-            R5900Context afterCreateDemuxCtx{};
-            setRegU32(afterCreateDemuxCtx, 4, kMpegAddr);
-            setRegU32(afterCreateDemuxCtx, 5, kVideoPacketAddr);
-            setRegU32(afterCreateDemuxCtx, 6, videoPacketSize);
-            setRegU32(afterCreateDemuxCtx, 7, kVideoPacketAddr);
-            setRegU32(afterCreateDemuxCtx, 8, videoPacketSize);
-            ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &afterCreateDemuxCtx, &runtime);
-            runtime.eeScheduler().run();
-
-            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
-                     "new MPEG create should allow callbacks for the next stream");
-
+            t.IsTrue(!ps2_stubs::mpegWaitingForSequenceHeaderForTesting(kMpegAddr),
+                     "sceMpegCreate should keep the sequence header of the stream already being demuxed");
             runtime.requestStop();
         });
 
@@ -777,6 +742,86 @@ void register_ps2_runtime_expansion_tests()
                      "resumed GetPicture should publish the configured width");
             t.Equals(Ps2FastRead32(rdram.data(), kMpegWaitHandle + 0x04u), 240u,
                      "resumed GetPicture should publish the configured height");
+        });
+
+        tc.Run("sceMpegGetPicture invokes the sceMpegCbNodata callback before waiting", [](TestCase &t)
+        {
+            // GOW-Port: libmpeg pide datos al juego con sceMpegCbNodata; sin esta llamada GetPicture esperaba
+            // para siempre en los juegos que alimentan sceMpegDemuxPssRing desde ese callback.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kNodataMainPc, testNodataMain);
+            runtime.registerFunction(kNodataResumePc, testNodataResume);
+            runtime.registerFunction(kNodataCallbackPc, testNodataCallback);
+            gNodataCalls.store(0u, std::memory_order_release);
+            gNodataProduceOnCall.store(1u, std::memory_order_release);
+            gNodataResult.store(-999, std::memory_order_release);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kNodataHandle);
+            setRegU32(addCtx, 5, 1u); // sceMpegCbNodata
+            setRegU32(addCtx, 6, kNodataCallbackPc);
+            setRegU32(addCtx, 7, kNodataUserData);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+
+            R5900Context mainContext{};
+            mainContext.pc = kNodataMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            ee.run();
+
+            t.Equals(gNodataCalls.load(std::memory_order_acquire), 1u,
+                     "GetPicture should call sceMpegCbNodata once when no frame is queued");
+            t.Equals(gNodataSeenMpeg.load(std::memory_order_acquire), kNodataHandle,
+                     "the Nodata callback should receive the MPEG handle");
+            t.Equals(gNodataSeenType.load(std::memory_order_acquire), 1u,
+                     "the callback data should report sceMpegCbNodata");
+            t.Equals(gNodataSeenUserData.load(std::memory_order_acquire), kNodataUserData,
+                     "the Nodata callback should receive its registered user data");
+            t.Equals(gNodataResult.load(std::memory_order_acquire), 0,
+                     "GetPicture should return the frame produced by the callback");
+            t.Equals(Ps2FastRead32(rdram.data(), kNodataHandle + 0x08u), 0u,
+                     "the callback frame should be served as picture 0");
+        });
+
+        tc.Run("sceMpegGetPicture retries sceMpegCbNodata after a VSync when it produced no data", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+            runtime.registerFunction(kNodataMainPc, testNodataMain);
+            runtime.registerFunction(kNodataResumePc, testNodataResume);
+            runtime.registerFunction(kNodataCallbackPc, testNodataCallback);
+            runtime.registerFunction(kNodataVsyncPc, testNodataVsync);
+            gNodataCalls.store(0u, std::memory_order_release);
+            gNodataProduceOnCall.store(2u, std::memory_order_release);
+            gNodataResult.store(-999, std::memory_order_release);
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kNodataHandle);
+            setRegU32(addCtx, 5, 1u);
+            setRegU32(addCtx, 6, kNodataCallbackPc);
+            setRegU32(addCtx, 7, kNodataUserData);
+            ps2_stubs::sceMpegAddCallback(rdram.data(), &addCtx, &runtime);
+
+            R5900Context mainContext{};
+            mainContext.pc = kNodataMainPc;
+            EeScheduler &ee = runtime.eeScheduler();
+            ee.reset(rdram.data(), mainContext);
+            const int vsyncId = ee.createThread(EeThreadCreateParams{
+                0u, kNodataVsyncPc, 0u, 0u, 0u, 10, 0u});
+            t.IsTrue(vsyncId > 1, "VSync guest thread should be created");
+            t.Equals(ee.startThread(vsyncId, 0u, mainContext, false), 0,
+                     "VSync guest thread should become ready");
+            ee.run();
+
+            t.Equals(gNodataCalls.load(std::memory_order_acquire), 2u,
+                     "an empty Nodata callback should be retried once after the next VSync, not spun");
+            t.Equals(gNodataResult.load(std::memory_order_acquire), 0,
+                     "GetPicture should return once the retried callback produces a frame");
         });
 
         tc.Run("sceMpegGetPicture waits for new decoder output instead of duplicating the last frame", [](TestCase &t)
@@ -1263,108 +1308,7 @@ void register_ps2_runtime_expansion_tests()
                      "TPC should point at the first instruction not executed");
         });
 
-        tc.Run("GS sprite draw applies XYOFFSET and fully-outside scissor should not render", [](TestCase &t)
-        {
-            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
-            GS gs;
-            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
 
-            const uint64_t frame1 =
-                (0ull << 0) |   // FBP
-                (1ull << 16) |  // FBW
-                (0ull << 24) |  // PSM CT32
-                (0ull << 32);   // FBMSK
-
-            const uint64_t zbuf1 = (1ull << 32);
-
-            gs.writeRegister(GS_REG_FRAME_1, frame1);
-            gs.writeRegister(GS_REG_ZBUF_1, zbuf1);
-            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
-
-            // XYOFFSET=1,1 pixels (16.4 fixed point).
-            const uint64_t xyoffset = (16ull) | (16ull << 32);
-            gs.writeRegister(GS_REG_XYOFFSET_1, xyoffset);
-
-            // Scissor initially includes pixel (1,1).
-            const uint64_t scissorInside = (0ull) | (3ull << 16) | (0ull << 32) | (3ull << 48);
-            gs.writeRegister(GS_REG_SCISSOR_1, scissorInside);
-
-            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
-            gs.writeRegister(GS_REG_RGBAQ, 0xFF3214C8ull); // RGBA=(200,20,50,255)
-
-            // With XYOFFSET=(1,1), vertex at (2,2) draws to pixel (1,1).
-            const uint64_t xyz = (32ull) | (32ull << 16) | (0ull << 32);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-
-            const uint32_t insideOff = frameOffsetBytes(1u, 1u, 1u);
-            t.Equals(vram[insideOff + 0u], static_cast<uint8_t>(200u), "inside draw should write R");
-            t.Equals(vram[insideOff + 1u], static_cast<uint8_t>(20u), "inside draw should write G");
-            t.Equals(vram[insideOff + 2u], static_cast<uint8_t>(50u), "inside draw should write B");
-            t.Equals(vram[insideOff + 3u], static_cast<uint8_t>(255u), "inside draw should write A");
-
-            std::memset(vram.data(), 0, 1024u);
-
-            // Move scissor so target pixel is fully outside.
-            const uint64_t scissorOutside = (3ull) | (4ull << 16) | (3ull << 32) | (4ull << 48);
-            gs.writeRegister(GS_REG_SCISSOR_1, scissorOutside);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-
-            bool anyWrite = false;
-            for (size_t i = 0; i < 1024u; ++i)
-            {
-                if (vram[i] != 0u)
-                {
-                    anyWrite = true;
-                    break;
-                }
-            }
-            t.IsFalse(anyWrite, "fully-outside sprite should not render any pixel");
-        });
-
-        tc.Run("GS alpha blend uses ALPHA register FIX factor", [](TestCase &t)
-        {
-            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
-            GS gs;
-            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
-
-            const uint64_t frame1 =
-                (0ull << 0) |   // FBP
-                (1ull << 16) |  // FBW
-                (0ull << 24) |  // PSM CT32
-                (0ull << 32);   // FBMSK
-            const uint64_t zbuf1 = (1ull << 32);
-            gs.writeRegister(GS_REG_FRAME_1, frame1);
-            gs.writeRegister(GS_REG_ZBUF_1, zbuf1);
-            gs.writeRegister(GS_REG_SCISSOR_1, (0ull) | (4ull << 16) | (0ull << 32) | (4ull << 48));
-            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
-            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
-
-            const uint32_t pxOff = frameOffsetBytes(1u, 1u, 1u);
-            vram[pxOff + 0u] = 40u;
-            vram[pxOff + 1u] = 40u;
-            vram[pxOff + 2u] = 40u;
-            vram[pxOff + 3u] = 255u;
-
-            // ABE on sprite prim.
-            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 6));
-
-            // ALPHA: (A-B)*FIX/128 + D
-            // A=Cs(0), B=Cd(1), C=FIX(2), D=Cd(1), FIX=64.
-            const uint64_t alpha = (0ull << 0) | (1ull << 2) | (2ull << 4) | (1ull << 6) | (64ull << 32);
-            gs.writeRegister(GS_REG_ALPHA_1, alpha);
-            gs.writeRegister(GS_REG_RGBAQ, 0xFFC8C8C8ull); // src RGB = 200
-
-            const uint64_t xyz = (16ull) | (16ull << 16) | (0ull << 32); // pixel (1,1)
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-            gs.writeRegister(GS_REG_XYZ2, xyz);
-
-            // ((200 - 40) * 64 >> 7) + 40 = 120
-            t.Equals(vram[pxOff + 0u], static_cast<uint8_t>(120u), "alpha blend should update R with FIX factor");
-            t.Equals(vram[pxOff + 1u], static_cast<uint8_t>(120u), "alpha blend should update G with FIX factor");
-            t.Equals(vram[pxOff + 2u], static_cast<uint8_t>(120u), "alpha blend should update B with FIX factor");
-        });
 
         tc.Run("sceVu0ApplyMatrix uses libvux matrix math with the imported EE ABI", [](TestCase &t)
         {

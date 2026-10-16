@@ -242,16 +242,26 @@ else()
     endif()
 endif()
 
-if(PS2X_IS_ANDROID)
-    set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
-else()
-    set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+# GOW-Port: MPEG video (FMV) is decoded by the vendored libmpeg2 (third_party/libmpeg2, portable C, also builds for
+# the Switch). FFmpeg stays available as an opt-in alternative backend.
+add_library(libmpeg2 STATIC
+    third_party/libmpeg2/alloc.c
+    third_party/libmpeg2/cpu_accel.c
+    third_party/libmpeg2/cpu_state.c
+    third_party/libmpeg2/decode.c
+    third_party/libmpeg2/header.c
+    third_party/libmpeg2/idct.c
+    third_party/libmpeg2/motion_comp.c
+    third_party/libmpeg2/slice.c
+)
+target_include_directories(libmpeg2 PUBLIC third_party/libmpeg2)
+if(MSVC)
+    target_compile_options(libmpeg2 PRIVATE /W0)
 endif()
 
-option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
+option(PS2X_ENABLE_FFMPEG "Decode MPEG video with FFmpeg instead of libmpeg2" OFF)
 
 if(NOT PS2X_ENABLE_FFMPEG)
-    message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
     add_library(ffmpeg INTERFACE)
 elseif(WIN32)
     include(ExternalProject)
@@ -382,19 +392,50 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_audio_vag.cpp
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
-    src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_stage.cpp # GOW-Port: GS frontend stage pipelined behind VU1.
+    src/lib/gs/gs_display.cpp # GOW-Port: native display state + GS FINISH handshake (no-emulation step 5).
+    src/lib/gs/gs_host_present.cpp # GOW-Port: mismo consumidor de textura en juego y controles.
+        # GOW-Port: backend OpenGL y cola del fork SotC ac9efa0 (GPL-3.0).
+    src/lib/gs/gs_threaded_backend.cpp
+    src/lib/gs/gs_swizzle.cpp
+    src/lib/gs/gpu/gs_gl.cpp
+    src/lib/gs/gpu/gs_hw_backend.cpp
+
+src/lib/gs/gpu/gs_texture_store.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_audio_device.cpp # GOW-Port: sound output on a chosen device
+    src/lib/ps2_pad_rumble_win.cpp # GOW-Port: Windows gamepad rumble (XInput, DualShock 4 / DualSense)
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
+    # GOW-Port: EE differential tester (PS2X_EE_DIFF) with PCSX2's EE interpreter and VU0 ops (GPL-3.0+).
+    src/lib/ee_ref/ee_diff.cpp
+    src/lib/ee_watch.cpp
+    src/lib/ee_ref/eeref.cpp
+    src/lib/ee_ref/R5900OpcodeImpl.cpp
+    src/lib/ee_ref/R5900OpcodeTables.cpp
+    src/lib/ee_ref/MMI.cpp
+    src/lib/ee_ref/FPU.cpp
+    src/lib/vu_pcsx2/pcsx2_vu0_cop2.cpp
+    src/lib/vu_pcsx2/pcsx2_vu1_bridge.cpp
+    src/lib/vu_pcsx2/VUops.cpp
+    src/lib/vu_pcsx2/VUflags.cpp
+    src/lib/vu_pcsx2/VU1microInterp.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
 )
+
+# GOW-Port: las fuentes de PCSX2 incluyen "common/..." relativo a su carpeta. MSVC lo encuentra buscando en la
+# carpeta del archivo que incluye; GCC y Clang no, así que se añade como ruta de inclusión solo para ellas.
+set_source_files_properties(
+    src/lib/ee_ref/ee_diff.cpp src/lib/ee_ref/eeref.cpp src/lib/ee_ref/R5900OpcodeImpl.cpp
+    src/lib/ee_ref/R5900OpcodeTables.cpp src/lib/ee_ref/MMI.cpp src/lib/ee_ref/FPU.cpp
+    PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/ee_ref")
 
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
@@ -506,11 +547,88 @@ target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg libmpeg2 ps2_iop)
+if(WIN32)
+    # GOW-Port: WGL propio del hilo GS.
+    target_link_libraries(ps2_runtime PRIVATE opengl32 gdi32)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+# GOW-Port: microcódigo de VU1 compilado. PS2X_VU1_MICROCODE_DIR es una carpeta local con micromemorias de
+# 16 KB capturadas con GOW_VU1_CAPTURA; PS2X_VU1_GENERATOR_SOURCE es tools/vu1/generar_vu1.cpp. El C++
+# generado se enlaza en el ejecutable y el despachador lo usa en lugar del intérprete para los pares que
+# coinciden. Son datos del juego: se generan en la carpeta de compilación y no se publican.
+set(PS2X_VU1_MICROCODE_DIR "" CACHE PATH "Micromemorias de VU1 capturadas (vacío: solo intérprete)")
+set(PS2X_VU1_GENERATOR_SOURCE "" CACHE FILEPATH "Generador de C++ para VU1 (tools/vu1/generar_vu1.cpp)")
+if(PS2X_VU1_MICROCODE_DIR AND PS2X_VU1_GENERATOR_SOURCE AND NOT PS2X_IS_ANDROID AND NOT PS2X_IS_VITA)
+    file(GLOB PS2X_VU1_IMAGES CONFIGURE_DEPENDS "${PS2X_VU1_MICROCODE_DIR}/*.bin")
+    if(PS2X_VU1_IMAGES)
+        add_executable(ps2x_vu1_generator "${PS2X_VU1_GENERATOR_SOURCE}")
+        target_link_libraries(ps2x_vu1_generator PRIVATE ps2_runtime)
+        set(PS2X_VU1_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/vu1_generado")
+        set(PS2X_VU1_GENERATED_PARTS)
+        foreach(part RANGE 0 12)
+            list(APPEND PS2X_VU1_GENERATED_PARTS "${PS2X_VU1_GENERATED_DIR}/programa${part}.cpp")
+        endforeach()
+        add_custom_command(OUTPUT ${PS2X_VU1_GENERATED_PARTS}
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${PS2X_VU1_GENERATED_DIR}"
+            # GOW-Port: la carpeta, no cada archivo: miles de rutas superan la línea de órdenes de Windows.
+            COMMAND "$<TARGET_FILE:ps2x_vu1_generator>" "${PS2X_VU1_GENERATED_DIR}" "${PS2X_VU1_MICROCODE_DIR}"
+            DEPENDS ps2x_vu1_generator ${PS2X_VU1_IMAGES}
+            VERBATIM)
+        target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1_GENERATED_PARTS})
+        set_source_files_properties(${PS2X_VU1_GENERATED_PARTS} PROPERTIES
+            SKIP_UNITY_BUILD_INCLUSION ON
+            SKIP_PRECOMPILE_HEADERS ON)
+        target_include_directories(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
+        if(MSVC)
+            set_source_files_properties(${PS2X_VU1_GENERATED_PARTS} PROPERTIES COMPILE_OPTIONS "/bigobj")
+        endif()
+        # GOW-Port: native lean backend (tools/vu1/vu1n_gen.py): straight-line blocks with immediate semantics.
+        find_package(Python3 COMPONENTS Interpreter)
+        set(PS2X_VU1N_GEN_OVERRIDE "" CACHE FILEPATH "Alternative vu1n_gen.py (empty: tools/vu1/vu1n_gen.py of the root repo)")
+        if(PS2X_VU1N_GEN_OVERRIDE)
+            set(PS2X_VU1N_GEN "${PS2X_VU1N_GEN_OVERRIDE}")
+        else()
+            get_filename_component(PS2X_VU1N_GEN "${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/vu1/vu1n_gen.py" ABSOLUTE)
+        endif()
+        if(Python3_FOUND AND EXISTS "${PS2X_VU1N_GEN}")
+            set(PS2X_VU1N_DIR "${CMAKE_CURRENT_BINARY_DIR}/vu1n_generado")
+            set(PS2X_VU1N_PARTS)
+            foreach(part RANGE 0 5)
+                list(APPEND PS2X_VU1N_PARTS "${PS2X_VU1N_DIR}/vu1n_part${part}.cpp")
+            endforeach()
+            # GOW-Port: entradas extra de la VU1 nativa; por defecto junto a la carpeta de micromemorias.
+            set(PS2X_VU1N_HEADS_FILE "" CACHE FILEPATH "vu1n_heads.txt alternativo (vacío: <micromemorias>/../vu1n_heads.txt)")
+            if(PS2X_VU1N_HEADS_FILE)
+                set(PS2X_VU1N_HEADS "${PS2X_VU1N_HEADS_FILE}")
+            else()
+                set(PS2X_VU1N_HEADS "${PS2X_VU1_MICROCODE_DIR}/../vu1n_heads.txt")
+            endif()
+            get_filename_component(PS2X_VU1N_HEADS "${PS2X_VU1N_HEADS}" ABSOLUTE)
+            set(PS2X_VU1N_HEADS_DEP)
+            if(EXISTS "${PS2X_VU1N_HEADS}")
+                set(PS2X_VU1N_HEADS_DEP "${PS2X_VU1N_HEADS}")
+            endif()
+            add_custom_command(OUTPUT ${PS2X_VU1N_PARTS}
+                COMMAND "${Python3_EXECUTABLE}" -I "${PS2X_VU1N_GEN}" "${PS2X_VU1N_DIR}" "${PS2X_VU1_MICROCODE_DIR}" --heads "${PS2X_VU1N_HEADS}" --parts 6
+                DEPENDS "${PS2X_VU1N_GEN}" ${PS2X_VU1_IMAGES} ${PS2X_VU1N_HEADS_DEP}
+                VERBATIM)
+            target_sources(ps2EntryRunner PRIVATE ${PS2X_VU1N_PARTS})
+            set_source_files_properties(${PS2X_VU1N_PARTS} PROPERTIES
+                SKIP_UNITY_BUILD_INCLUSION ON
+                SKIP_PRECOMPILE_HEADERS ON)
+            if(MSVC)
+                set_source_files_properties(${PS2X_VU1N_PARTS} PROPERTIES COMPILE_OPTIONS "/bigobj")
+            endif()
+        endif()
+        list(LENGTH PS2X_VU1_IMAGES PS2X_VU1_IMAGE_COUNT)
+        message(STATUS "VU1 compilada: ${PS2X_VU1_IMAGE_COUNT} micromemorias en ${PS2X_VU1_MICROCODE_DIR}")
+    endif()
+endif()
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
@@ -608,3 +726,6 @@ endif()
 install(DIRECTORY include/
     DESTINATION include
 )
+
+# GOW-Port include
+target_include_directories(ps2EntryRunner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/runner)
