@@ -23,3 +23,5 @@ android/app/.cxx/
 android/local.properties
 android/.gradle/ 
 .idea/
+# Generated from the game's IRX modules by tools/iop/iopn_gen.py: game-derived, never commit
+ps2xIOP/src/native/iopn_*.cpp
