@@ -141,6 +141,9 @@ namespace ps2x::iop::detail
         LibsdState g_libsd;
 
         constexpr uint64_t kTransferCompletionCycles = 512u; // the completion handler runs shortly after the call
+        // GoW2-Port: LIBSD.IRX builds, by text size (IopNativeOverride::textSize)
+        constexpr uint32_t kLibsdGow1 = 0x4840u; // God of War
+        constexpr uint32_t kLibsdGow2 = 0x4bb0u; // God of War II
 
         // 0x1560: SPU2 bus setup, called by the module start: SSBUS delay/address registers (0x1F801014/1404/140C/
         // 1414) and the SPU2 DMA enable bits in DPCR/DPCR2. No bus, DMA controller or SPU2 exists behind them.
@@ -326,22 +329,41 @@ namespace ps2x::iop::detail
             {"sio2man_irx", 0x0014u, "sio2man ctrl_get", &sio2CtrlGet},
             {"sio2d_irx", 0x0978u, "sio2d probe_pad", &sio2dProbePad},
             {"sio2d_irx", 0x0a1cu, "sio2d probe_card", &sio2dProbeCard},
-            {"libsd_irx", 0x1560u, "libsd bus setup", &sdBusSetup},
-            {"libsd_irx", 0x456cu, "sceSdInit", &sdInit},
-            {"libsd_irx", 0x3670u, "sceSdSetParam", &sdSetParam},
-            {"libsd_irx", 0x36ccu, "sceSdGetParam", &sdGetParam},
-            {"libsd_irx", 0x372cu, "sceSdSetSwitch", &sdSetSwitch},
-            {"libsd_irx", 0x3764u, "sceSdGetSwitch", &sdGetSwitch},
-            {"libsd_irx", 0x379cu, "sceSdSetAddr", &sdSetAddr},
-            {"libsd_irx", 0x3800u, "sceSdGetAddr", &sdGetAddr},
-            {"libsd_irx", 0x3cbcu, "sceSdSetCoreAttr", &sdSetCoreAttr},
-            {"libsd_irx", 0x18a0u, "sceSdVoiceTrans", &sdVoiceTrans},
-            {"libsd_irx", 0x1c30u, "sceSdBlockTrans", &sdBlockTrans},
-            {"libsd_irx", 0x1af0u, "sceSdVoiceTransStatus", &sdVoiceTransStatus},
-            {"libsd_irx", 0x1e4cu, "sceSdBlockTransStatus", &sdBlockTransStatus},
-            {"libsd_irx", 0x0c3cu, "sceSdSetEffectAttr", &sdSetEffectAttr},
-            {"libsd_irx", 0x3e3cu, "sceSdSetTransIntrHandler", &sdSetTransIntrHandler},
-            {"libsd_irx", 0x0984u, "sceSdSetEffectWorkArea", &sdSetEffectWorkArea},
+            // God of War's LIBSD.IRX (text 0x4840)
+            {"libsd_irx", 0x1560u, "libsd bus setup", &sdBusSetup, kLibsdGow1},
+            {"libsd_irx", 0x456cu, "sceSdInit", &sdInit, kLibsdGow1},
+            {"libsd_irx", 0x3670u, "sceSdSetParam", &sdSetParam, kLibsdGow1},
+            {"libsd_irx", 0x36ccu, "sceSdGetParam", &sdGetParam, kLibsdGow1},
+            {"libsd_irx", 0x372cu, "sceSdSetSwitch", &sdSetSwitch, kLibsdGow1},
+            {"libsd_irx", 0x3764u, "sceSdGetSwitch", &sdGetSwitch, kLibsdGow1},
+            {"libsd_irx", 0x379cu, "sceSdSetAddr", &sdSetAddr, kLibsdGow1},
+            {"libsd_irx", 0x3800u, "sceSdGetAddr", &sdGetAddr, kLibsdGow1},
+            {"libsd_irx", 0x3cbcu, "sceSdSetCoreAttr", &sdSetCoreAttr, kLibsdGow1},
+            {"libsd_irx", 0x18a0u, "sceSdVoiceTrans", &sdVoiceTrans, kLibsdGow1},
+            {"libsd_irx", 0x1c30u, "sceSdBlockTrans", &sdBlockTrans, kLibsdGow1},
+            {"libsd_irx", 0x1af0u, "sceSdVoiceTransStatus", &sdVoiceTransStatus, kLibsdGow1},
+            {"libsd_irx", 0x1e4cu, "sceSdBlockTransStatus", &sdBlockTransStatus, kLibsdGow1},
+            {"libsd_irx", 0x0c3cu, "sceSdSetEffectAttr", &sdSetEffectAttr, kLibsdGow1},
+            {"libsd_irx", 0x3e3cu, "sceSdSetTransIntrHandler", &sdSetTransIntrHandler, kLibsdGow1},
+            {"libsd_irx", 0x0984u, "sceSdSetEffectWorkArea", &sdSetEffectWorkArea, kLibsdGow1},
+            // GoW2-Port: God of War II's LIBSD.IRX (text 0x4bb0): offsets from its export table; the bus setup (not
+            // exported) is the only match of God of War's 0x1560 instruction pattern
+            {"libsd_irx", 0x1550u, "libsd bus setup", &sdBusSetup, kLibsdGow2},
+            {"libsd_irx", 0x48e4u, "sceSdInit", &sdInit, kLibsdGow2},
+            {"libsd_irx", 0x39a0u, "sceSdSetParam", &sdSetParam, kLibsdGow2},
+            {"libsd_irx", 0x39fcu, "sceSdGetParam", &sdGetParam, kLibsdGow2},
+            {"libsd_irx", 0x3a5cu, "sceSdSetSwitch", &sdSetSwitch, kLibsdGow2},
+            {"libsd_irx", 0x3a94u, "sceSdGetSwitch", &sdGetSwitch, kLibsdGow2},
+            {"libsd_irx", 0x3accu, "sceSdSetAddr", &sdSetAddr, kLibsdGow2},
+            {"libsd_irx", 0x3b30u, "sceSdGetAddr", &sdGetAddr, kLibsdGow2},
+            {"libsd_irx", 0x3fecu, "sceSdSetCoreAttr", &sdSetCoreAttr, kLibsdGow2},
+            {"libsd_irx", 0x1890u, "sceSdVoiceTrans", &sdVoiceTrans, kLibsdGow2},
+            {"libsd_irx", 0x1c70u, "sceSdBlockTrans", &sdBlockTrans, kLibsdGow2},
+            {"libsd_irx", 0x1b10u, "sceSdVoiceTransStatus", &sdVoiceTransStatus, kLibsdGow2},
+            {"libsd_irx", 0x2024u, "sceSdBlockTransStatus", &sdBlockTransStatus, kLibsdGow2},
+            {"libsd_irx", 0x0c2cu, "sceSdSetEffectAttr", &sdSetEffectAttr, kLibsdGow2},
+            {"libsd_irx", 0x416cu, "sceSdSetTransIntrHandler", &sdSetTransIntrHandler, kLibsdGow2},
+            {"libsd_irx", 0x097cu, "sceSdSetEffectWorkArea", &sdSetEffectWorkArea, kLibsdGow2},
         };
     }
 

@@ -870,6 +870,13 @@ namespace ps2x::iop::detail
             module.path = std::move(path);
             const size_t slash = module.path.find_last_of("/\\:");
             module.name = slash == std::string::npos ? module.path : module.path.substr(slash + 1u);
+            // GoW2-Port: drop the ISO 9660 version ("LIBSD.IRX;1" -> "LIBSD.IRX"). God of War II loads its modules as
+            // "cdrom0:\NAME.IRX;1", so the native override identifiers ("libsd_irx") never matched.
+            if (const size_t semicolon = module.name.rfind(';'); semicolon != std::string::npos &&
+                semicolon + 1u < module.name.size() &&
+                std::all_of(module.name.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u), module.name.end(),
+                            [](unsigned char c) { return std::isdigit(c) != 0; }))
+                module.name.resize(semicolon);
             module.base = loaded.base;
             module.size = loaded.size;
             module.entry = loaded.entry;
@@ -958,7 +965,8 @@ namespace ps2x::iop::detail
                 size_t overrideCount = 0;
                 const IopNativeOverride *overrides = iopNativeOverrides(overrideCount);
                 for (size_t i = 0; i < overrideCount; ++i)
-                    if (ident == overrides[i].module && overrides[i].offset < module.textSize)
+                    if (ident == overrides[i].module && overrides[i].offset < module.textSize &&
+                        (overrides[i].textSize == 0u || overrides[i].textSize == module.textSize))
                         nativeOverrides[lo + overrides[i].offset] = &overrides[i];
             }
             size_t count = 0;

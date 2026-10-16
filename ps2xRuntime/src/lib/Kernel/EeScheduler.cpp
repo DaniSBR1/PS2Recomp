@@ -12,6 +12,10 @@
 
 namespace
 {
+    // GoW2-Port: context of the guest code being executed; accountCycles keeps its COP0 Count equal to the EE cycle
+    // counter (one scheduler executes the guest, so a file-level pointer is enough).
+    R5900Context *g_countContext = nullptr;
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -301,19 +305,24 @@ void EeScheduler::run()
             m_guestExecuting.store(true, std::memory_order_release);
             ps2_perf::guestEntry(context.pc, m_rdram);
             loadSharedVu0Random(context);
+            context.cop0_count = static_cast<uint32_t>(m_eeCycle);
+            g_countContext = &context;
             function(m_rdram, &context, &m_runtime);
+            g_countContext = nullptr;
             saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            g_countContext = nullptr;
             saveSharedVu0Random(context);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (...)
         {
+            g_countContext = nullptr;
             m_guestExecuting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
             publishSnapshot();
@@ -399,6 +408,10 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
+    // GoW2-Port: COP0 Count ticks with every EE cycle. The recompiler reads ctx->cop0_count for "mfc0 Count", and
+    // nothing advanced it: God of War II's loader (0x18CF70) spins until Count passes a per-frame deadline.
+    if (g_countContext != nullptr)
+        g_countContext->cop0_count = static_cast<uint32_t>(m_eeCycle);
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
     if (m_pendingEeTimerInterrupts != 0u)

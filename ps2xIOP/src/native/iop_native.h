@@ -47,6 +47,9 @@ namespace ps2x::iop::detail
         uint32_t offset;    // from the module base
         const char *name;
         void (*handler)(IopNativeCall &call);
+        // GoW2-Port: text size of the module build the offset belongs to (0 = any). God of War and God of War II ship
+        // different LIBSD.IRX builds under the same name, so their function offsets differ.
+        uint32_t textSize = 0u;
     };
 
     // src/native/iop_native_overrides.cpp
