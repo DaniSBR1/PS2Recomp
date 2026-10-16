@@ -12,6 +12,7 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
+#include "ps2_perf_overlay.h"
 #include "ps2x/iop/iop_subsystem.h"
 
 #include <iostream>
@@ -2464,6 +2465,8 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        // Before the debug UI: ImGui leaves the rlgl state changed and later raylib draws are lost.
+        ps2_perf_overlay::frame(*this);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
