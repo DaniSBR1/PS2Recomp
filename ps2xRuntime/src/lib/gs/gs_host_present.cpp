@@ -6,10 +6,15 @@
 #include "ps2_log.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+
+void ps2WindowDisableKeyMenu(void *windowHandle); // ps2_window_win.cpp
 
 namespace
 {
@@ -111,6 +116,96 @@ void main()
         }
         return g_scaler.id != 0u ? &g_scaler : nullptr;
     }
+
+    // GoW2-Port: performance overlay (F10), after PCSX2's PerformanceMetrics + ImGuiManager::DrawPerformanceOverlay
+    // (PCSX2, GPLv3+): the metrics are recomputed every 0.5 s; VPS = guest vertical blanks per second (with a 16 sample
+    // average), FPS = new frames the game hands to the GS, speed = VPS against the NTSC rate, frame times from the host
+    // frames. Drawn top right with a drop shadow; the speed line turns red below 95 % and green above 105 %, as in PCSX2.
+    struct PerfOverlay
+    {
+        static constexpr double kUpdateInterval = 0.5; // seconds, PCSX2's UPDATE_INTERVAL
+        static constexpr double kNtscRate = 59.94;
+        static constexpr size_t kAvgSamples = 16;      // PCSX2's FPS_BUFFER_SIZE
+
+        bool visible = [] { const char *v = std::getenv("GOW_SHOW_FPS"); return v && *v == '1'; }();
+        uint64_t gameFrames = 0;   // new GS frames since the last update
+        uint64_t hostFrames = 0;
+        uint64_t lastVsync = 0;
+        bool vsyncKnown = false;
+        double frameTimeSum = 0.0, frameTimeMin = 1e9, frameTimeMax = 0.0;
+        std::chrono::steady_clock::time_point lastUpdate = std::chrono::steady_clock::now();
+        std::array<double, kAvgSamples> vpsHistory{};
+        size_t vpsCount = 0, vpsPos = 0;
+        // last computed values
+        double fps = 0.0, vps = 0.0, avgVps = 0.0, speed = 0.0, hostFps = 0.0, ftMin = 0.0, ftAvg = 0.0, ftMax = 0.0;
+
+        void update(uint64_t vsyncTick)
+        {
+            ++hostFrames;
+            const double frameMs = GetFrameTime() * 1000.0;
+            frameTimeSum += frameMs;
+            frameTimeMin = std::min(frameTimeMin, frameMs);
+            frameTimeMax = std::max(frameTimeMax, frameMs);
+            if (!vsyncKnown)
+            {
+                lastVsync = vsyncTick;
+                vsyncKnown = true;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const double time = std::chrono::duration<double>(now - lastUpdate).count();
+            if (time < kUpdateInterval)
+                return;
+            lastUpdate = now;
+            vps = static_cast<double>(vsyncTick - lastVsync) / time;
+            lastVsync = vsyncTick;
+            fps = static_cast<double>(gameFrames) / time;
+            hostFps = static_cast<double>(hostFrames) / time;
+            speed = vps / kNtscRate * 100.0;
+            ftAvg = frameTimeSum / static_cast<double>(std::max<uint64_t>(hostFrames, 1u));
+            ftMin = frameTimeMin;
+            ftMax = frameTimeMax;
+            // PCSX2's AvgFPS: 16 samples, restarted when the rate jumps by more than 20 %
+            if (vpsCount != 0 && avgVps > 0.0 && std::fabs(vps - avgVps) > avgVps * 0.2)
+                vpsCount = vpsPos = 0;
+            vpsHistory[vpsPos] = vps;
+            vpsPos = (vpsPos + 1) % kAvgSamples;
+            vpsCount = std::min(vpsCount + 1, kAvgSamples);
+            double sum = 0.0;
+            for (size_t i = 0; i < vpsCount; ++i)
+                sum += vpsHistory[i];
+            avgVps = sum / static_cast<double>(vpsCount);
+            gameFrames = hostFrames = 0;
+            frameTimeSum = frameTimeMax = 0.0;
+            frameTimeMin = 1e9;
+        }
+
+        void draw() const
+        {
+            if (!visible)
+                return;
+            const float fontSize = std::max(20.0f, GetScreenHeight() / 40.0f);
+            const float spacing = fontSize / 10.0f, margin = fontSize * 0.5f, shadow = std::ceil(fontSize / 20.0f);
+            const Font font = GetFontDefault();
+            const Color white{255, 255, 255, 255};
+            const Color speedColor = speed < 95.0 ? Color{255, 100, 100, 255} : speed > 105.0 ? Color{100, 255, 100, 255} : white;
+            char lines[4][96];
+            std::snprintf(lines[0], sizeof(lines[0]), "FPS: %.2f", fps);
+            std::snprintf(lines[1], sizeof(lines[1]), "VPS: %.2f (Avg. %.2f)", vps, avgVps);
+            std::snprintf(lines[2], sizeof(lines[2]), "Speed: %u%%", static_cast<unsigned>(std::lround(speed)));
+            std::snprintf(lines[3], sizeof(lines[3]), "Host: %.0f FPS | Min: %.2fms | Avg: %.2fms | Max: %.2fms", hostFps, ftMin, ftAvg, ftMax);
+            float y = margin;
+            for (int i = 0; i < 4; ++i)
+            {
+                const Vector2 size = MeasureTextEx(font, lines[i], fontSize, spacing);
+                const Vector2 pos{GetScreenWidth() - margin - size.x, y};
+                DrawTextEx(font, lines[i], Vector2{pos.x + shadow, pos.y + shadow}, fontSize, spacing, Color{0, 0, 0, 100});
+                DrawTextEx(font, lines[i], pos, fontSize, spacing, i == 2 ? speedColor : white);
+                y += size.y + spacing;
+            }
+        }
+    };
+
+    PerfOverlay g_perfOverlay;
 }
 
 void GSHostPresentation::captureHostContext()
@@ -198,6 +293,7 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
             {
                 gs.recordAcquiredSharedFrame(frame);
                 lastSharedSequence = frame.sequence;
+                ++g_perfOverlay.gameFrames;
             }
             if (!frame.blank && frame.texture != 0u && frame.width != 0u && frame.height != 0u)
             {
@@ -235,6 +331,7 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
                       << " preferred=" << static_cast<uint32_t>(preferred ? 1u : 0u) << std::endl;
         ++uploadDebugCount;
     });
+    ++g_perfOverlay.gameFrames; // RAM frames: one per latched vertical blank that produced a frame
     lastDisplayFbp = displayFbp;
     lastSourceFbp = sourceFbp;
     lastPreferred = preferred;
@@ -290,11 +387,20 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
 
 GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncTick, const std::function<void()> &overlay)
 {
+    // GoW2-Port: F12 toggles borderless full screen / window (does not change the monitor's mode), F10 the performance
+    // overlay (GOW_SHOW_FPS=1 shows it from the start)
+    static const bool keyMenuDisabled = [] { ps2WindowDisableKeyMenu(GetWindowHandle()); return true; }();
+    (void)keyMenuDisabled;
+    if (IsKeyPressed(KEY_F12))
+        ToggleBorderlessWindowed();
+    if (IsKeyPressed(KEY_F10))
+        g_perfOverlay.visible = !g_perfOverlay.visible;
     View selected;
     {
         ps2_perf::Scope perf(ps2_perf::Bucket::Upload);
         selected = prepare(gs, vsyncTick);
     }
+    g_perfOverlay.update(vsyncTick);
     BeginDrawing();
     ClearBackground(BLACK);
     const float sourceWidth = static_cast<float>(std::max<uint32_t>(1u, selected.width));
@@ -331,6 +437,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
     DrawTexturePro(selected.texture, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     if (scaler)
         EndShaderMode();
+    g_perfOverlay.draw();
     if (overlay)
         overlay();
     // GOW-Port: GOW_HOST_SHOT=<n>: at host frame n write the window's back buffer (what is about to be shown) to
