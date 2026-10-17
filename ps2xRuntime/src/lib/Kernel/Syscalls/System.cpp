@@ -468,6 +468,32 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    // GOW-Port: crt0's argument block ($a3 of SetupThread), as the ps2sdk declares it: int argc; char *argv[16];
+    // char payload[256]. crt0 passes argc and argv to main straight from it. The kernel fills it with the boot
+    // arguments; booted from the disc, that is argc = 1 and argv[0] = "cdrom0:\<ELF>;1" (SYSTEM.CNF BOOT2). Left
+    // untouched, main saw argc = 0 and God of War II built empty IOP module paths.
+    static void writeBootArguments(uint8_t *rdram, uint32_t args)
+    {
+        constexpr uint32_t kArgvOffset = 4u, kPayloadOffset = kArgvOffset + 16u * 4u, kPayloadSize = 256u;
+        std::string name = PS2Runtime::getIoPaths().elfPath.filename().string();
+        if (name.empty())
+            return;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c)
+                       { return static_cast<char>(std::toupper(c)); });
+        const std::string arg0 = "cdrom0:\\" + name + ";1";
+        if (arg0.size() + 1u > kPayloadSize)
+            return;
+        for (uint32_t i = 0; i < arg0.size() + 1u; ++i)
+        {
+            if (uint8_t *p = getMemPtr(rdram, args + kPayloadOffset + i))
+                *p = static_cast<uint8_t>(i < arg0.size() ? arg0[i] : '\0');
+        }
+        writeGuestKernelWord(rdram, args, 1u);
+        writeGuestKernelWord(rdram, args + kArgvOffset, args + kPayloadOffset);
+        writeGuestKernelWord(rdram, args + kArgvOffset + 4u, 0u);
+        std::cout << "[SetupThread] argc=1 argv[0]=" << arg0 << std::endl;
+    }
+
     // 0x3C SetupThread
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -475,9 +501,15 @@ namespace ps2_syscalls
         const uint32_t gp = getRegU32(ctx, 4);
         const uint32_t stack = getRegU32(ctx, 5);
         const int32_t stackSizeSigned = static_cast<int32_t>(getRegU32(ctx, 6));
+        const uint32_t args = getRegU32(ctx, 7);
         const uint32_t currentSp = getRegU32(ctx, 29);
         EeScheduler &scheduler = runtime->eeScheduler();
         scheduler.bindMainContextForSyscall(*ctx, rdram);
+
+        if (args != 0u)
+        {
+            writeBootArguments(rdram, args);
+        }
 
         if (gp != 0u)
         {
