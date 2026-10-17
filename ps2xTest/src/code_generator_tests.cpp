@@ -1174,6 +1174,34 @@ void register_code_generator_tests()
                      "SPECIAL logical ops should not use vector emission");
         });
 
+        tc.Run("MOVZ/MOVN move only the low 64 bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction movzInst{};
+            movzInst.opcode = OPCODE_SPECIAL;
+            movzInst.function = SPECIAL_MOVZ;
+            movzInst.rs = 4;
+            movzInst.rt = 5;
+            movzInst.rd = 6;
+
+            std::string movzCode = gen.translateInstruction(movzInst);
+            t.IsTrue(movzCode.find("if (GPR_U64(ctx, 5) == 0) SET_GPR_U64(ctx, 6, GPR_U64(ctx, 4));") != std::string::npos,
+                     "MOVZ should copy the low 64 bits of rs");
+
+            Instruction movnInst{};
+            movnInst.opcode = OPCODE_SPECIAL;
+            movnInst.function = SPECIAL_MOVN;
+            movnInst.rs = 7;
+            movnInst.rt = 8;
+            movnInst.rd = 9;
+
+            std::string movnCode = gen.translateInstruction(movnInst);
+            t.IsTrue(movnCode.find("if (GPR_U64(ctx, 8) != 0) SET_GPR_U64(ctx, 9, GPR_U64(ctx, 7));") != std::string::npos,
+                     "MOVN should copy the low 64 bits of rs");
+            t.IsTrue(movzCode.find("SET_GPR_VEC") == std::string::npos && movnCode.find("SET_GPR_VEC") == std::string::npos,
+                     "MOVZ/MOVN must keep the upper 64 bits of rd (R5900: UD[0] only)");
+        });
+
         tc.Run("SC requires matching LL reservation address", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
