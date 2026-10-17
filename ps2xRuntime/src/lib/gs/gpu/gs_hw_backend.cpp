@@ -116,7 +116,10 @@ uniform vec2 uRtPx;      // render target size in PS2 pixels
 
 uint tab(uint i) { return texelFetch(uTables, ivec2(int(i & 2047u), int(i >> 11)), 0).r; }
 
-vec4 reinterpretTexel(ivec2 p)
+// sub: where inside texel p the sample falls (0..1). The target is scaled: the host texel under that point is read, never
+// leaving the PS2 pixel that owns the texel, so a 1:1 reinterpreting copy (the alpha remaps through T8H of the frame)
+// keeps the scaled picture's edges instead of giving every host pixel of a PS2 pixel the same value.
+vec4 reinterpretTexel(ivec2 p, vec2 sub)
 {
     uint x = uint(p.x), y = uint(p.y);
     uint psx = uint(uTexFmt.x), psy = uint(uTexFmt.y);
@@ -138,7 +141,11 @@ vec4 reinterpretTexel(ivec2 p)
     uint fbw = uint(uRtFmt2.z);
     uint px = (rpage % fbw) * (1u << rpsx) + (e & ((1u << rpsx) - 1u));
     uint py = (rpage / fbw) * (1u << rpsy) + (e >> rpsx);
-    vec4 c = texture(uRtColor, (vec2(float(px), float(py)) + 0.5) / uRtPx) * 255.0;
+    vec2 hs = vec2(textureSize(uRtColor, 0)) / uRtPx; // host texels per PS2 pixel
+    vec2 own = vec2(float(px), float(py));
+    ivec2 lo = ivec2(floor(own * hs + 0.001)), hi = max(lo, ivec2(ceil((own + 1.0) * hs - 0.001)) - 1);
+    ivec2 hp = clamp(ivec2(floor((own + clamp(sub, 0.0, 1.0)) * hs + 0.001)), lo, hi);
+    vec4 c = texelFetch(uRtColor, hp, 0) * 255.0;
     c = floor(c + 0.5);
     uint word;
     if (B == 32u)
@@ -239,7 +246,7 @@ void main()
         {
             ivec2 ip = ivec2(floor(uv));
             ip = ivec2(clamp(ip.x, 0, uTex0.z - 1), clamp(ip.y, 0, uTex0.w - 1));
-            t = reinterpretTexel(ip) * 255.0;
+            t = reinterpretTexel(ip, uv - floor(uv)) * 255.0;
         }
         else if (uIndexed != 0)
         {
@@ -410,7 +417,7 @@ uniform usampler2D uCoords;
 void main()
 {
     uvec2 c = texelFetch(uCoords, ivec2(int(gl_FragCoord.x), 0), 0).rg;
-    oColor = reinterpretTexel(ivec2(c));
+    oColor = reinterpretTexel(ivec2(c), vec2(0.5));
 }
 )";
 
