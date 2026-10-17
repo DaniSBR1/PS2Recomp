@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <vector>
@@ -40,6 +41,7 @@ namespace ps2x::iop::detail
     private:
         void load();
         void persist(uint32_t offset, size_t size);
+        void closeFile();
 
         std::string m_path;
         bool m_present = false;
@@ -47,6 +49,9 @@ namespace ps2x::iop::detail
         bool m_fileExists = false;
         std::vector<uint8_t> m_image;
         uint32_t m_address = 0;
+        // Kept open between writes: formatting or saving writes thousands of pages, and reopening the 8 MB image for
+        // each one made saving take tens of seconds (docs/NOTES.md, "Memory card: rendimiento").
+        std::fstream m_file;
     };
 
     // The two card slots; the image file of a slot is resolved on first use (GOW_MC0 / GOW_MC1 / Mcd001.ps2).

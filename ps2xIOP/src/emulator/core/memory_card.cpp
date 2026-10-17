@@ -8,6 +8,7 @@ namespace ps2x::iop::detail
 {
     void MemoryCard::insert(std::string path)
     {
+        closeFile();
         m_path = std::move(path);
         m_present = true;
         m_loaded = false;
@@ -18,6 +19,7 @@ namespace ps2x::iop::detail
 
     void MemoryCard::eject()
     {
+        closeFile();
         m_present = false;
         m_loaded = false;
         m_image.clear();
@@ -50,23 +52,48 @@ namespace ps2x::iop::detail
             return;
         if (!m_fileExists)
         {
-            // Primera escritura: se crea el archivo con la imagen entera
-            std::ofstream file(m_path, std::ios::binary | std::ios::trunc);
-            if (!file)
+            // First write: the file is created with the whole image
+            closeFile();
+            m_file.open(m_path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+            if (!m_file)
             {
                 std::cerr << "[SIO2] no se puede crear la memory card " << m_path << std::endl;
+                closeFile();
                 return;
             }
-            file.write(reinterpret_cast<const char *>(m_image.data()), static_cast<std::streamsize>(m_image.size()));
-            m_fileExists = static_cast<bool>(file);
+            m_file.write(reinterpret_cast<const char *>(m_image.data()), static_cast<std::streamsize>(m_image.size()));
+            m_file.flush();
+            m_fileExists = static_cast<bool>(m_file);
+            if (!m_fileExists)
+                closeFile();
             std::cerr << "[SIO2] memory card creada en " << m_path << std::endl;
             return;
         }
-        std::fstream file(m_path, std::ios::binary | std::ios::in | std::ios::out);
-        if (!file)
-            return;
-        file.seekp(offset);
-        file.write(reinterpret_cast<const char *>(m_image.data() + offset), static_cast<std::streamsize>(size));
+        if (!m_file.is_open())
+        {
+            m_file.open(m_path, std::ios::binary | std::ios::in | std::ios::out);
+            if (!m_file)
+            {
+                closeFile();
+                return;
+            }
+        }
+        m_file.seekp(offset);
+        m_file.write(reinterpret_cast<const char *>(m_image.data() + offset), static_cast<std::streamsize>(size));
+        // Flush to the OS on every write, so the card survives the runner being closed or crashing mid-save.
+        m_file.flush();
+        if (!m_file)
+        {
+            std::cerr << "[SIO2] error al escribir la memory card " << m_path << std::endl;
+            closeFile();
+        }
+    }
+
+    void MemoryCard::closeFile()
+    {
+        if (m_file.is_open())
+            m_file.close();
+        m_file.clear();
     }
 
     void MemoryCard::read(uint8_t *destination, size_t size)
