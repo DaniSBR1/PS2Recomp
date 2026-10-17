@@ -1550,6 +1550,94 @@ struct GSHwBackend::Impl
                      c.scissor.x0, c.scissor.x1, c.scissor.y0, c.scissor.y1);
     }
 
+    static bool isZFormat(uint8_t psm) { return psm == 0x30 || psm == 0x31 || psm == 0x32 || psm == 0x3A; }
+
+    // Whether target t's Z buffer memory contains page `page` of a buffer `fbw` wide, and the PS2 row that page starts on in
+    // that Z buffer (a buffer starting further into the memory addresses lower rows of the same Z buffer). Several targets
+    // can have their GL depth attached to the same Z memory (the frame and the post passes drawn with the same ZBUF).
+    static bool depthRowOf(const RenderTarget &t, uint32_t page, uint32_t fbw, uint8_t zpsm, int &rowOffset)
+    {
+        if (!t.depth || page < t.zbp || std::max<uint32_t>(fbw, 1u) != t.fbw)
+            return false;
+        const uint32_t delta = page - t.zbp;
+        if (delta % t.fbw != 0u)
+            return false;
+        rowOffset = static_cast<int>(delta / t.fbw) * ((zpsm == 0x32 || zpsm == 0x3A) ? 64 : 32);
+        return rowOffset < static_cast<int>(t.pxH);
+    }
+
+    // GoW2-Port: an untextured sprite drawn with a Z format into the memory of a target's Z buffer (FRAME.PSM =
+    // PSMZ32/24/16, FRAME.FBP inside that memory) writes Z words directly. God of War II clears its Z buffer this way between
+    // the sky and the world, so the sky leaves its colour but not its depth: 512x224 sprites write Z = 0 to the top half
+    // through FRAME (0x78) and, with their own ZBUF at 0xB0 (ZTST ALWAYS), to the bottom half through the Z write. Both
+    // writes go to the GL depth buffer of the target that owns that memory, inside the sprite and the scissor. Returns
+    // false when nothing of the sprite lands in a Z buffer.
+    bool depthClearSprite(const GSDrawState &s, const GSPrimitiveBatch &b)
+    {
+        const GSContext &c = s.context;
+        if (s.prim.tme || c.frame.fbmsk != 0u)
+            return false;
+        const GSVertex &v = b.vertices[1]; // sprites take their colour and Z from the second vertex
+        const bool zWrites = ((c.test >> 16) & 1u) != 0u && ((c.test >> 17) & 3u) == 1u && !c.zbuf.zmask;
+        bool any = false;
+        for (const RenderTarget &t : targets)
+        {
+            int row = 0;
+            any = any || depthRowOf(t, c.frame.fbp, c.frame.fbw, c.frame.psm, row) ||
+                  (zWrites && depthRowOf(t, c.zbuf.zbp, c.frame.fbw, c.zbuf.psm, row));
+        }
+        if (!any)
+            return false;
+        flushPending();
+        if (!ensure())
+            return true;
+        double frameZ;
+        if (c.frame.psm == 0x32 || c.frame.psm == 0x3A) // Z16: the colour packs like PSMCT16
+            frameZ = static_cast<double>((v.r >> 3) | ((v.g >> 3) << 5) | ((v.b >> 3) << 10) | ((v.a >> 7) << 15));
+        else
+            frameZ = static_cast<double>(static_cast<uint32_t>(v.r) | (static_cast<uint32_t>(v.g) << 8) | (static_cast<uint32_t>(v.b) << 16) |
+                                         (c.frame.psm == 0x30 ? (static_cast<uint32_t>(v.a) << 24) : 0u));
+        const float ox = static_cast<float>(c.xyoffset.ofx) / 16.0f, oy = static_cast<float>(c.xyoffset.ofy) / 16.0f;
+        // the sprite covers pixels [ceil(x0), ceil(x1)) like the GS, clipped by the scissor (inclusive bounds)
+        const int x0 = std::max<int>(c.scissor.x0, static_cast<int>(std::ceil(std::min(b.vertices[0].x, v.x) - ox)));
+        const int y0 = std::max<int>(c.scissor.y0, static_cast<int>(std::ceil(std::min(b.vertices[0].y, v.y) - oy)));
+        const int x1 = std::min<int>(c.scissor.x1 + 1, static_cast<int>(std::ceil(std::max(b.vertices[0].x, v.x) - ox)));
+        const int y1 = std::min<int>(c.scissor.y1 + 1, static_cast<int>(std::ceil(std::max(b.vertices[0].y, v.y) - oy)));
+        if (x1 <= x0 || y1 <= y0)
+            return true;
+        const Api &g = gl();
+        const auto clearRows = [&](RenderTarget &t, int rowOffset, double z, uint8_t zpsm)
+        {
+            const int ty0 = y0 + rowOffset, ty1 = std::min<int>(y1 + rowOffset, static_cast<int>(t.pxH));
+            if (ty1 <= ty0)
+                return;
+            g.BindFramebuffer(kFramebuffer, t.fbo);
+            g.Viewport(0, 0, t.glW, t.glH);
+            g.Enable(kScissorTest);
+            g.Scissor(static_cast<GLint>(std::floor(x0 * scale)), static_cast<GLint>(std::floor(ty0 * scale)),
+                      static_cast<GLsizei>(std::ceil((x1 - x0) * scale)), static_cast<GLsizei>(std::ceil((ty1 - ty0) * scale)));
+            g.DepthMask(kTrue);
+            g.ClearDepth(std::min(std::max(z, 0.0) / static_cast<double>(zMaxFor(zpsm)), 1.0));
+            g.Clear(kDepthBufferBit);
+            g.Disable(kScissorTest);
+            t.lastDepthSeq = ++writeSeq;
+            // the memory now holds these literal values, not an inverted Z buffer
+            const auto inv = std::find(invertedZ.begin(), invertedZ.end(), t.zbp);
+            if (inv != invertedZ.end())
+                invertedZ.erase(inv);
+        };
+        for (RenderTarget &t : targets)
+        {
+            int row = 0;
+            if (depthRowOf(t, c.frame.fbp, c.frame.fbw, c.frame.psm, row))
+                clearRows(t, row, frameZ, c.frame.psm);
+            if (zWrites && depthRowOf(t, c.zbuf.zbp, c.frame.fbw, c.zbuf.psm, row))
+                clearRows(t, row, std::min(v.z, static_cast<double>(zMaxFor(c.zbuf.psm))), c.zbuf.psm);
+        }
+        ++stats.draws;
+        return true;
+    }
+
     void submit(const GSPrimitiveBatch &b)
     {
         const GSDrawState &s = b.state;
@@ -1567,6 +1655,8 @@ struct GSHwBackend::Impl
         if (family16(fpsm) && tryShuffle(s, b))
             return;
         flushShuffle();
+        if (isZFormat(fpsm) && sprite && depthClearSprite(s, b))
+            return;
         if (fpsm != GS_PSM_CT32 && fpsm != GS_PSM_CT24 && fpsm != GS_PSM_CT16 && fpsm != GS_PSM_CT16S)
         {
             ++stats.skippedPsm;
