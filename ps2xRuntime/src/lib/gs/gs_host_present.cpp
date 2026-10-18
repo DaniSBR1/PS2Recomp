@@ -122,7 +122,8 @@ void main()
     // (PCSX2, GPLv3+): the metrics are recomputed every 0.5 s; VPS = guest vertical blanks per second (with a 16 sample
     // average), speed = VPS against the NTSC rate, frame times from the host frames. FPS is PCSX2's internal FPS: game
     // frame flips (a new display buffer, FBP of DISPFB1/2) per second, "[P]"; a game that never flips falls back to the
-    // new frames handed to the GS, "[B]" (PCSX2's framebuffer blits). Drawn top right with a drop shadow; the speed line
+    // new frames handed to the GS, "[B]" (PCSX2's framebuffer blits). When the game's override names its per-frame
+    // function (ps2_perf::setGameFramePc), FPS counts its entries instead, "[G]". Drawn top right with a drop shadow; the speed line
     // turns red below 95 % and green above 105 %, as in PCSX2.
     struct PerfOverlay
     {
@@ -135,6 +136,8 @@ void main()
         uint64_t flips = 0;        // display buffer changes since the last update
         uint64_t lastFbp = ~0ull;
         bool flipMethod = false;
+        bool gameFrameMethod = false;   // FPS from the game's per-frame function (ps2_perf::gameFramePc)
+        uint64_t lastGameFrameEntries = 0;
         uint64_t hostFrames = 0;
         uint64_t lastVsync = 0;
         bool vsyncKnown = false;
@@ -172,7 +175,11 @@ void main()
             vps = static_cast<double>(vsyncTick - lastVsync) / time;
             lastVsync = vsyncTick;
             flipMethod = flips != 0;
-            fps = static_cast<double>(flipMethod ? flips : gameFrames) / time;
+            const uint64_t entries = ps2_perf::gameFrameEntries.load(std::memory_order_relaxed);
+            gameFrameMethod = ps2_perf::gameFramePc.load(std::memory_order_relaxed) != 0u;
+            const uint64_t gameFunctionFrames = entries - lastGameFrameEntries;
+            lastGameFrameEntries = entries;
+            fps = static_cast<double>(gameFrameMethod ? gameFunctionFrames : flipMethod ? flips : gameFrames) / time;
             hostFps = static_cast<double>(hostFrames) / time;
             speed = vps / kNtscRate * 100.0;
             ftAvg = frameTimeSum / static_cast<double>(std::max<uint64_t>(hostFrames, 1u));
@@ -203,7 +210,7 @@ void main()
             const Color white{255, 255, 255, 255};
             const Color speedColor = speed < 95.0 ? Color{255, 100, 100, 255} : speed > 105.0 ? Color{100, 255, 100, 255} : white;
             char lines[4][96];
-            std::snprintf(lines[0], sizeof(lines[0]), "FPS: %.2f %s", fps, flipMethod ? "[P]" : "[B]");
+            std::snprintf(lines[0], sizeof(lines[0]), "FPS: %.2f %s", fps, gameFrameMethod ? "[G]" : flipMethod ? "[P]" : "[B]");
             std::snprintf(lines[1], sizeof(lines[1]), "VPS: %.2f (Avg. %.2f)", vps, avgVps);
             std::snprintf(lines[2], sizeof(lines[2]), "Speed: %u%%", static_cast<unsigned>(std::lround(speed)));
             std::snprintf(lines[3], sizeof(lines[3]), "Host: %.0f FPS | Min: %.2fms | Avg: %.2fms | Max: %.2fms", hostFps, ftMin, ftAvg, ftMax);

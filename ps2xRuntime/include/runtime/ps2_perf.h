@@ -120,8 +120,18 @@ namespace ps2_perf
                      frames && maxDelta > 0.0 ? minDelta : 0.0, maxDelta);
         windowStart = now; frames = 0; gameSeconds = 0.0; minDelta = 1e9; maxDelta = 0.0;
     }
+    // GoW2-Port: the game's once-per-frame function, set by its override (God of War II: 0x14E380, which hands each
+    // frame to the GS). The F10 overlay counts its entries as the game's FPS: a game that draws every frame into a
+    // single display buffer never flips, and new GS frames come at the vertical blank rate whatever the game does.
+    inline std::atomic<uint32_t> gameFramePc{0};
+    inline std::atomic<uint64_t> gameFrameEntries{0};
+    inline void setGameFramePc(uint32_t pc) { gameFramePc.store(pc, std::memory_order_relaxed); }
+
     inline void guestEntry(uint32_t pc, const uint8_t *rdram = nullptr)
     {
+        const uint32_t gamePc = gameFramePc.load(std::memory_order_relaxed);
+        if (gamePc != 0u && pc == gamePc)
+            gameFrameEntries.fetch_add(1, std::memory_order_relaxed);
         static const bool frames = countFrames(), speed = deltaDiag();
         if (!frames && !speed) return;
         static const uint32_t framePc = [] {
