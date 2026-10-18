@@ -1565,9 +1565,8 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     // los paquetes de VU1 quedaban a cero y los personajes se dibujaban como polígonos gigantes.
     if (mode == 1u)
         return processScratchpadChain(channelBase, chcr);
-    if (mode != 0u)
+    if (mode != 0u && mode != 2u)
     {
-        // GOW-Port: interleave (MOD=2) is not implemented; report it so a missing transfer is visible.
         static unsigned reports = 0u;
         if (++reports <= 20u)
             std::fprintf(stderr, "[dma] SPR %s mode %u not handled (chcr=%08x qwc=%u madr=%08x sadr=%04x)\n",
@@ -1578,49 +1577,66 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     }
 
     const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
-    const uint32_t byteCount = qwc * 16u;
-    const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
     const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
+    uint32_t madr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
 
-    uint32_t mainOffset = 0u;
-    try
+    // GOW-Port: interleave mode (MOD=2, scratchpad channels only): blocks of D_SQWC.TQWC quadwords, skipping
+    // D_SQWC.SQWC quadwords of main memory after each block, while the scratchpad address runs on (EE DMAC spec;
+    // PCSX2 _SPR0interleave / _SPR1interleave, TQWC 0 = the whole transfer). God of War II de-interleaves its stereo
+    // movie audio this way (0x1901E8); without it the SPU2 got the same stale buffer every time (a constant beep).
+    // Normal mode is one block of QWC quadwords.
+    uint32_t tqwc = qwc;
+    uint32_t sqwc = 0u;
+    if (mode == 2u)
     {
-        mainOffset = translateAddress(originalMadr);
+        const auto it = m_ioRegisters.find(0x1000E030u); // D_SQWC
+        const uint32_t sqwcReg = it != m_ioRegisters.end() ? it->second : 0u;
+        sqwc = sqwcReg & 0xFFu;
+        tqwc = (sqwcReg >> 16u) & 0xFFu;
+        if (tqwc == 0u)
+            tqwc = qwc;
     }
-    catch (const std::exception &)
-    {
-        return false;
-    }
-
-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
-        return false;
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
     uint32_t scratchOffset = originalSadr;
-    uint32_t bytesLeft = byteCount;
-    uint32_t copied = 0u;
-    while (bytesLeft != 0u)
+    for (uint32_t left = qwc; left != 0u;)
     {
-        const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
-        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
-        if (fromScratchpad)
+        const uint32_t blockQwc = std::min(left, tqwc);
+        const uint32_t blockBytes = blockQwc * 16u;
+        uint32_t mainOffset = 0u;
+        try
         {
-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
-            markModified(mainOffset + copied, chunk);
+            mainOffset = translateAddress(madr);
         }
-        else
+        catch (const std::exception &)
         {
-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+            return false;
         }
+        if (mainOffset > PS2_RAM_SIZE || blockBytes > PS2_RAM_SIZE - mainOffset)
+            return false;
 
-        copied += chunk;
-        bytesLeft -= chunk;
-        scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+        for (uint32_t copied = 0u; copied < blockBytes;)
+        {
+            const uint32_t chunk = std::min(blockBytes - copied, PS2_SCRATCHPAD_SIZE - scratchOffset);
+            if (fromScratchpad)
+            {
+                std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+                markModified(mainOffset + copied, chunk);
+            }
+            else
+            {
+                std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+            }
+            copied += chunk;
+            scratchOffset = (scratchOffset + chunk) & (PS2_SCRATCHPAD_SIZE - 1u);
+        }
+        left -= blockQwc;
+        madr = (madr + blockBytes + sqwc * 16u) & 0x7FFFFFF0u;
     }
 
-    m_ioRegisters[channelBase + 0x10u] = (originalMadr + byteCount) & 0x7FFFFFF0u;
+    m_ioRegisters[channelBase + 0x10u] = madr;
     m_ioRegisters[channelBase + 0x20u] = 0u;
-    m_ioRegisters[channelBase + 0x80u] = (originalSadr + byteCount) & 0x3FF0u;
+    m_ioRegisters[channelBase + 0x80u] = scratchOffset & 0x3FF0u;
     queueCompletedDmacCause(fromScratchpad ? 8u : 9u);
     return true;
 }
