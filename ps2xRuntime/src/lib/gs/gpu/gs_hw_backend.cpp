@@ -281,7 +281,16 @@ void main()
             t = texture(uTex, (floor(uv * host / uTexSize + 0.001) + 0.5) / host) * 255.0;
         }
         else
-            t = texture(uTex, uv / uTexSize) * 255.0;
+        {
+            // A render target drawn at scale k holds in host texel j what the GS drew at pixel j / k (see addVertex), which
+            // read back as a texture lies at u = j / k + 0.5; GL filtering takes texel j to be at (j + 0.5) / k. Shifting u
+            // by 0.5 - 0.5 / k makes the filter blend the texels the GS blends: unshifted, every filtered read of a scaled
+            // target took its picture from 0.5 - 0.5 / k texels to the right, and a chain of them (God of War II's bloom:
+            // halve the frame twice, blur, enlarge, add it back) left the glow several pixels to the left of what casts it.
+            // Uploaded textures (k = 1) are unchanged.
+            vec2 k = vec2(textureSize(uTex, 0)) / uTexSize;
+            t = texture(uTex, (uv - 0.5 + 0.5 / k) / uTexSize) * 255.0;
+        }
         t = floor(t + 0.5);
         if (uRtTex24 == 1)
             t.a = (uAem != 0 && t.r + t.g + t.b == 0.0) ? 0.0 : uTa0;
