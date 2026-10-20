@@ -82,6 +82,7 @@ uniform sampler2D uTex;
 uniform vec2 uTexSize;   // size the sampled image is normalised by (render targets: their own size)
 uniform vec2 uTexDim;    // TEX0 TW/TH: size STQ coordinates are scaled by
 uniform vec2 uRtClamp;   // 1 per axis: a render target sampled in CLAMP mode, clamped to TW x TH rather than to the target
+uniform float uPxScale;  // internal scale: host pixels per PS2 pixel
 
 // Reinterpreting fetch: the texture lives in the memory a render target was drawn into, but with another format / width /
 // layout (16 bit view of a 32 bit target, T8H = alpha plane, other pitch...). The texel's GS memory address is computed
@@ -238,6 +239,17 @@ void main()
         // at the internal scale a pixel samples between the GS's sample points: keep it inside the range the GS samples
         // (sprites), so filtering never reaches the texel beyond the primitive's last one
         uv = clamp(uv, vUVClamp.xy, vUVClamp.zw);
+        // Point sampling a scaled render target: the GS takes texel floor(u) at the PS2 pixel's sample point, and the host
+        // pixels of that PS2 pixel take the host texels of that texel in the same order (inPx: where the host pixel lies
+        // inside its PS2 pixel, subPx: the matching place inside the texel). A 1:1 copy is then exact whatever the game's
+        // texel convention; taking floor(u) at each host pixel instead read one host texel to the right for copies at
+        // texel centres (u = x + 0.5): God of War II's depth haze, remapped from the frame's alpha through T8H, sat one
+        // host pixel off the picture and fringed every silhouette in blue.
+        vec2 stepX = dFdx(uv) * uPxScale, stepY = dFdy(uv) * uPxScale; // texel change per PS2 pixel
+        vec2 inPx = fract((gl_FragCoord.xy - 0.5) / uPxScale);
+        vec2 dIn = inPx.x * stepX + inPx.y * stepY;
+        vec2 subPx = clamp(mix(dIn, 1.0 + dIn, lessThan(dIn, vec2(0.0))), 0.0, 0.999);
+        vec2 uvPs2 = floor((uv - dIn) * 16.0 + 0.015625) / 16.0; // the GS's coordinate at the sample point
         // point sampling picks texel floor(u) of the GS's 1/16 texel coordinate: truncate like the GS (the 1/64 step
         // absorbs float interpolation error, a 1:1 copy lands exactly on texel edges)
         if (uLinear == 0)
@@ -245,9 +257,10 @@ void main()
         vec4 t;
         if (uReinterp != 0)
         {
-            ivec2 ip = ivec2(floor(uv));
+            bool pt = uLinear == 0;
+            ivec2 ip = ivec2(floor(pt ? uvPs2 : uv));
             ip = ivec2(clamp(ip.x, 0, uTex0.z - 1), clamp(ip.y, 0, uTex0.w - 1));
-            t = reinterpretTexel(ip, uv - floor(uv)) * 255.0;
+            t = reinterpretTexel(ip, pt ? subPx : uv - floor(uv)) * 255.0;
         }
         else if (uIndexed != 0)
         {
@@ -265,7 +278,9 @@ void main()
         else if (uZTex != 0)
         {
             vec2 zhost = vec2(textureSize(uTex, 0)); // depth is always point sampled: the host texel's centre
-            float zf = texture(uTex, (floor(uv * zhost / uTexSize + 0.001) + 0.5) / zhost).r;
+            vec2 zk = zhost / uTexSize;
+            vec2 zp = (zk.x > 1.0 || zk.y > 1.0) ? floor((floor(uvPs2) + subPx) * zk + 0.001) : floor(uv * zk + 0.001);
+            float zf = texture(uTex, (zp + 0.5) / zhost).r;
             uint zi = uint(clamp(zf, 0.0, 1.0) * uZMax + 0.5);
             if (uZTex == 16)
             {
@@ -278,9 +293,17 @@ void main()
         else if (uLinear == 0)
         {
             // the centre of the host texel (render targets are scaled) inside texel floor(u): never on a texel edge
-            uv = mix(uv, clamp(uv, vec2(0.0), uTexDim - 1.0 / 64.0), uRtClamp);
             vec2 host = vec2(textureSize(uTex, 0));
-            t = texture(uTex, (floor(uv * host / uTexSize + 0.001) + 0.5) / host) * 255.0;
+            vec2 k = host / uTexSize;
+            vec2 hp;
+            if (k.x > 1.0 || k.y > 1.0)
+            {
+                vec2 tp = floor(mix(uvPs2, clamp(uvPs2, vec2(0.0), uTexDim - 1.0 / 64.0), uRtClamp));
+                hp = floor((tp + subPx) * k + 0.001);
+            }
+            else
+                hp = floor(uv * k + 0.001);
+            t = texture(uTex, (hp + 0.5) / host) * 255.0;
         }
         else
         {
@@ -502,7 +525,7 @@ struct GSHwBackend::Impl
     float scale = 2.0f;
     GLuint program = 0, vao = 0, vbo = 0;
     GLint locInvSize = -1, locTex = -1, locTexSize = -1, locTexDim = -1, locTme = -1, locFst = -1, locTfx = -1, locTcc = -1, locIip = -1,
-          locAte = -1, locFailTint = -1, locAtst = -1, locAref = -1, locPass = -1, locBlendScale = -1, locRtTex24 = -1, locRtClamp = -1, locTa0 = -1, locTa1 = -1, locReinterp = -1, locDate = -1, locDatm = -1, locDest = -1, locZTex = -1, locZMax = -1, locTables = -1, locRtColor = -1, locPalette = -1, locTexFmt = -1, locTexFmt2 = -1,
+          locAte = -1, locFailTint = -1, locAtst = -1, locAref = -1, locPass = -1, locBlendScale = -1, locRtTex24 = -1, locRtClamp = -1, locPxScale = -1, locTa0 = -1, locTa1 = -1, locReinterp = -1, locDate = -1, locDatm = -1, locDest = -1, locZTex = -1, locZMax = -1, locTables = -1, locRtColor = -1, locPalette = -1, locTexFmt = -1, locTexFmt2 = -1,
           locRtFmt = -1, locRtFmt2 = -1, locTex0 = -1, locRtPx = -1, locAem = -1;
     GLint locIndexed = -1, locLinear = -1, locWrap = -1, locIdxPalette = -1;
     GLint locSwBlend = -1, locColClamp = -1, locAbcd = -1, locFix = -1, locZAlias = -1, locZAliasWrite = -1, locZAliasMax = -1;
@@ -663,7 +686,7 @@ struct GSHwBackend::Impl
         locIndexed = loc("uIndexed"); locLinear = loc("uLinear"); locWrap = loc("uWrap"); locIdxPalette = loc("uIdxPalette");
         locSwBlend = loc("uSwBlend"); locColClamp = loc("uColClamp"); locAbcd = loc("uAbcd"); locFix = loc("uFix");
         locZAlias = loc("uZAlias"); locZAliasWrite = loc("uZAliasWrite"); locZAliasMax = loc("uZAliasMax");
-        locRtTex24 = loc("uRtTex24"); locRtClamp = loc("uRtClamp"); locTa0 = loc("uTa0"); locTa1 = loc("uTa1"); locAem = loc("uAem");
+        locRtTex24 = loc("uRtTex24"); locRtClamp = loc("uRtClamp"); locPxScale = loc("uPxScale"); locTa0 = loc("uTa0"); locTa1 = loc("uTa1"); locAem = loc("uAem");
 
         g.GenVertexArrays(1, &vao);
         g.BindVertexArray(vao);
@@ -2143,6 +2166,7 @@ struct GSHwBackend::Impl
             g.Uniform1f(locZMax, zsrc ? zMaxFor(static_cast<uint8_t>(c.tex0.psm)) : 1.0f);
             g.Uniform1i(locRtTex24, !(src || rsrc) ? 0 : c.tex0.psm == GS_PSM_CT24 ? 1 : family16(c.tex0.psm) ? 2 : 0);
             g.Uniform2f(locRtClamp, src && (c.clamp & 3u) == 1u ? 1.0f : 0.0f, src && ((c.clamp >> 2) & 3u) == 1u ? 1.0f : 0.0f);
+            g.Uniform1f(locPxScale, scale);
             g.Uniform1i(locReinterp, rsrc ? 1 : 0);
             if (rsrc)
                 setupReinterpret(s, *rsrc);
