@@ -2,6 +2,16 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+// GOW-Port: puts the runtime's guest RAM pools (RPC packets/servers, TLS, boot mode) right below `top` and returns
+// their base. Called by PS2Runtime::setPrivateGuestHeap so they live in the private heap's range, not in the game's.
+uint32_t ps2RelocateKernelPools(uint32_t top)
+{
+    if (top < kKernelPoolsBytes)
+        return top;
+    g_kernelPoolsBase = (top - kKernelPoolsBytes) & ~0xFFu;
+    return g_kernelPoolsBase;
+}
+
 namespace ps2_syscalls
 {
     namespace

@@ -2186,9 +2186,15 @@ uint32_t PS2Runtime::guestHeapLimit() const
     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
 }
 
+uint32_t ps2RelocateKernelPools(uint32_t top); // Kernel/Syscalls/RPC.cpp
+
 void PS2Runtime::setPrivateGuestHeap(uint32_t base, uint32_t limit)
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    // GOW-Port: the runtime's RPC/TLS pools take the top of the private range (they used to sit at 0x01F00000,
+    // inside the game's heap).
+    if (limit > base)
+        limit = std::max(base, ps2RelocateKernelPools(limit));
     m_privateGuestHeapBase = base;
     m_privateGuestHeapLimit = limit;
     // Si el heap ya existe y no tiene bloques en uso, se mueve ya; si no, al siguiente SetupHeap.

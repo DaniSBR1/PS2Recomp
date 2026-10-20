@@ -242,22 +242,29 @@ inline std::filesystem::path g_host_cwd;
 inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
+// GOW-Port: guest RAM the runtime keeps for itself (RPC packets and server descriptors, TLS blocks, boot mode
+// entries). By default it sits at 0x01F00000, which is inside God of War II's own heap (it runs up to 0x01FF7FF8):
+// every SMPD call rewrote its server descriptor in the middle of the game's VU1 packets. setPrivateGuestHeap()
+// moves it to the top of the private heap (see ps2RelocateKernelPools).
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
-static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
+static constexpr uint32_t kRpcPacketPoolBytes = 0x00004000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
-static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
+static constexpr uint32_t kRpcServerPoolBytes = 0x00002000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;
 
-static constexpr uint32_t kTlsPoolBase = 0x01F20000;
 static constexpr uint32_t kTlsPoolBytes = 0x00010000;
 static constexpr uint32_t kTlsBlockSize = 0x100;
 static constexpr uint32_t kTlsPoolCount = kTlsPoolBytes / kTlsBlockSize;
 
-static constexpr uint32_t kBootModePoolBase = 0x01F30000;
 static constexpr uint32_t kBootModePoolBytes = 0x00001000;
+
+static constexpr uint32_t kKernelPoolsBytes = kRpcPacketPoolBytes + kRpcServerPoolBytes + kTlsPoolBytes + kBootModePoolBytes;
+inline uint32_t g_kernelPoolsBase = 0x01F00000;
+inline uint32_t kernelRpcPacketPoolBase() { return g_kernelPoolsBase; }
+inline uint32_t kernelRpcServerPoolBase() { return g_kernelPoolsBase + kRpcPacketPoolBytes; }
+inline uint32_t kernelTlsPoolBase() { return kernelRpcServerPoolBase() + kRpcServerPoolBytes; }
+inline uint32_t kernelBootModePoolBase() { return kernelTlsPoolBase() + kTlsPoolBytes; }
 
 static constexpr uint32_t kSifRpcModeNowait = 0x01;
 static constexpr uint32_t kSifRpcModeNoWbDc = 0x02;
