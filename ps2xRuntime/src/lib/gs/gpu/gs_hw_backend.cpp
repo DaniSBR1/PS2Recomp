@@ -246,7 +246,13 @@ void main()
         // texel centres (u = x + 0.5): God of War II's depth haze, remapped from the frame's alpha through T8H, sat one
         // host pixel off the picture and fringed every silhouette in blue.
         vec2 stepX = dFdx(uv) * uPxScale, stepY = dFdy(uv) * uPxScale; // texel change per PS2 pixel
-        vec2 inPx = fract((gl_FragCoord.xy - 0.5) / uPxScale);
+        // From whole numbers, not fract(h / scale): the GPU divides through an approximate reciprocal, so h / 3 can land
+        // just below an integer and fract gave 0.999 for a host pixel that starts its PS2 pixel; it then read the host
+        // texel on its left. The T8H haze pass reads the target it writes, and at every strip seam that texel had already
+        // been written by the previous strip: the haze applied twice there, a bright line every 32 PS2 pixels at scale 3.
+        vec2 hostPx = gl_FragCoord.xy - 0.5;
+        vec2 ps2Px = floor(hostPx / uPxScale + 0.001);
+        vec2 inPx = (hostPx - ps2Px * uPxScale) / uPxScale;
         vec2 dIn = inPx.x * stepX + inPx.y * stepY;
         vec2 subPx = clamp(mix(dIn, 1.0 + dIn, lessThan(dIn, vec2(0.0))), 0.0, 0.999);
         vec2 uvPs2 = floor((uv - dIn) * 16.0 + 0.015625) / 16.0; // the GS's coordinate at the sample point
