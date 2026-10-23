@@ -183,6 +183,7 @@ vec4 indexedTexel(ivec2 p)
     return texelFetch(uIdxPalette, ivec2(idx, 0), 0);
 }
 uniform int uTme, uFst, uTfx, uTcc, uIip;
+uniform int uAniso; // anisotropic filtering: most bilinear taps per host pixel (1 = off)
 uniform int uRtTex24; // sampling a render target as PSMCT24 (1) or PSMCT16 (2): alpha comes from TEXA
 uniform float uTa0;
 uniform float uTa1;
@@ -256,6 +257,15 @@ void main()
         vec2 dIn = inPx.x * stepX + inPx.y * stepY;
         vec2 subPx = clamp(mix(dIn, 1.0 + dIn, lessThan(dIn, vec2(0.0))), 0.0, 0.999);
         vec2 uvPs2 = floor((uv - dIn) * 16.0 + 0.015625) / 16.0; // the GS's coordinate at the sample point
+        // Anisotropic filtering (GOW_ANISO, uploaded textures with linear filtering), as the GPU does it: as many bilinear
+        // taps along the longer axis of the pixel's footprint as that axis is longer than the shorter one (at most uAniso),
+        // so a surface seen at a grazing angle averages the texels it covers instead of picking a few (shimmer and noise on
+        // floors and walls). A footprint shrunk the same on both axes keeps one tap. Done here because most of the game's
+        // textures are palettised and filtered by hand below.
+        bool anisoX = dot(stepX, stepX) >= dot(stepY, stepY);
+        vec2 anisoAxis = (anisoX ? stepX : stepY) / uPxScale;
+        float anisoMinor = length(anisoX ? stepY : stepX) / uPxScale;
+        int anisoTaps = uAniso > 1 ? clamp(int(ceil(length(anisoAxis) / max(anisoMinor, 1.0) - 0.01)), 1, uAniso) : 1;
         // point sampling picks texel floor(u) of the GS's 1/16 texel coordinate: truncate like the GS (the 1/64 step
         // absorbs float interpolation error, a 1:1 copy lands exactly on texel edges)
         if (uLinear == 0)
@@ -272,11 +282,16 @@ void main()
         {
             if (uLinear != 0)
             {
-                vec2 f = uv - 0.5;
-                ivec2 i0 = ivec2(floor(f));
-                vec2 w = f - floor(f);
-                t = mix(mix(indexedTexel(i0), indexedTexel(i0 + ivec2(1, 0)), w.x),
-                        mix(indexedTexel(i0 + ivec2(0, 1)), indexedTexel(i0 + ivec2(1, 1)), w.x), w.y) * 255.0;
+                t = vec4(0.0);
+                for (int i = 0; i < anisoTaps; ++i)
+                {
+                    vec2 f = uv + anisoAxis * ((float(i) + 0.5) / float(anisoTaps) - 0.5) - 0.5;
+                    ivec2 i0 = ivec2(floor(f));
+                    vec2 w = f - floor(f);
+                    t += mix(mix(indexedTexel(i0), indexedTexel(i0 + ivec2(1, 0)), w.x),
+                             mix(indexedTexel(i0 + ivec2(0, 1)), indexedTexel(i0 + ivec2(1, 1)), w.x), w.y);
+                }
+                t = t / float(anisoTaps) * 255.0;
             }
             else
                 t = indexedTexel(ivec2(floor(uv))) * 255.0;
@@ -326,7 +341,15 @@ void main()
             // centres is the same as clamping both taps.
             uv = mix(uv, clamp(uv, vec2(0.5), uTexDim - 0.5), uRtClamp);
             vec2 k = vec2(textureSize(uTex, 0)) / uTexSize;
-            t = texture(uTex, (uv - 0.5 + 0.5 / k) / uTexSize) * 255.0;
+            if (anisoTaps > 1) // only uploaded textures (k = 1)
+            {
+                t = vec4(0.0);
+                for (int i = 0; i < anisoTaps; ++i)
+                    t += textureLod(uTex, (uv + anisoAxis * ((float(i) + 0.5) / float(anisoTaps) - 0.5)) / uTexSize, 0.0);
+                t = t / float(anisoTaps) * 255.0;
+            }
+            else
+                t = texture(uTex, (uv - 0.5 + 0.5 / k) / uTexSize) * 255.0;
         }
         t = floor(t + 0.5);
         if (uRtTex24 == 1)
@@ -531,7 +554,7 @@ struct GSHwBackend::Impl
     float scale = 2.0f;
     GLuint program = 0, vao = 0, vbo = 0;
     GLint locInvSize = -1, locTex = -1, locTexSize = -1, locTexDim = -1, locTme = -1, locFst = -1, locTfx = -1, locTcc = -1, locIip = -1,
-          locAte = -1, locFailTint = -1, locAtst = -1, locAref = -1, locPass = -1, locBlendScale = -1, locRtTex24 = -1, locRtClamp = -1, locPxScale = -1, locTa0 = -1, locTa1 = -1, locReinterp = -1, locDate = -1, locDatm = -1, locDest = -1, locZTex = -1, locZMax = -1, locTables = -1, locRtColor = -1, locPalette = -1, locTexFmt = -1, locTexFmt2 = -1,
+          locAte = -1, locFailTint = -1, locAtst = -1, locAref = -1, locPass = -1, locBlendScale = -1, locRtTex24 = -1, locRtClamp = -1, locPxScale = -1, locAniso = -1, locTa0 = -1, locTa1 = -1, locReinterp = -1, locDate = -1, locDatm = -1, locDest = -1, locZTex = -1, locZMax = -1, locTables = -1, locRtColor = -1, locPalette = -1, locTexFmt = -1, locTexFmt2 = -1,
           locRtFmt = -1, locRtFmt2 = -1, locTex0 = -1, locRtPx = -1, locAem = -1;
     GLint locIndexed = -1, locLinear = -1, locWrap = -1, locIdxPalette = -1;
     GLint locSwBlend = -1, locColClamp = -1, locAbcd = -1, locFix = -1, locZAlias = -1, locZAliasWrite = -1, locZAliasMax = -1;
@@ -692,7 +715,7 @@ struct GSHwBackend::Impl
         locIndexed = loc("uIndexed"); locLinear = loc("uLinear"); locWrap = loc("uWrap"); locIdxPalette = loc("uIdxPalette");
         locSwBlend = loc("uSwBlend"); locColClamp = loc("uColClamp"); locAbcd = loc("uAbcd"); locFix = loc("uFix");
         locZAlias = loc("uZAlias"); locZAliasWrite = loc("uZAliasWrite"); locZAliasMax = loc("uZAliasMax");
-        locRtTex24 = loc("uRtTex24"); locRtClamp = loc("uRtClamp"); locPxScale = loc("uPxScale"); locTa0 = loc("uTa0"); locTa1 = loc("uTa1"); locAem = loc("uAem");
+        locRtTex24 = loc("uRtTex24"); locRtClamp = loc("uRtClamp"); locPxScale = loc("uPxScale"); locAniso = loc("uAniso"); locTa0 = loc("uTa0"); locTa1 = loc("uTa1"); locAem = loc("uAem");
 
         g.GenVertexArrays(1, &vao);
         g.BindVertexArray(vao);
@@ -1796,8 +1819,34 @@ struct GSHwBackend::Impl
             GSDrawState sp = s; // sprites carry texel UVs, never STQ
             (void)sp;
             GSVertex corner[4] = {a, a, a, a};
-            const float xs[2] = {a.x, c.x}, ys[2] = {a.y, c.y};
-            const float us[2] = {u0, u1}, vs[2] = {v0, v1};
+            // The GS covers pixel n when x0 <= n < x1, so an edge between two pixels covers what the next whole pixel would.
+            // Left there, at the internal scale it drew a fraction of a PS2 pixel: God of War II's water and underworld
+            // distortion copies the frame in vertical strips that end at x + 0.5 while the next one starts at x + 1, which
+            // left a column of host pixels unpainted at every seam (dark wavy lines; PCSX2's alignSprite, "Fixes water
+            // vertical lines", widens such sprites). Both edges go to the pixels the GS covers, in window space, and the
+            // texel coordinates follow at the same texels per pixel; scale 1 is unchanged.
+            float xs[2] = {a.x, c.x}, ys[2] = {a.y, c.y};
+            float us[2] = {u0, u1}, vs[2] = {v0, v1};
+            // returns false when the sprite covers no pixel on the GS along that axis
+            const auto snap = [](float (&p)[2], float (&t)[2], float off)
+            {
+                const float w0 = p[0] - off, w1 = p[1] - off;
+                const float s0 = std::ceil(w0), s1 = std::ceil(w1);
+                if (w0 == w1 || s0 == s1)
+                    return false;
+                const float k = (t[1] - t[0]) / (w1 - w0);
+                t[0] += (s0 - w0) * k;
+                t[1] += (s1 - w1) * k;
+                p[0] = s0 + off;
+                p[1] = s1 + off;
+                return true;
+            };
+            const bool coversX = snap(xs, us, s.context.xyoffset.ofx / 16.0f);
+            const bool coversY = snap(ys, vs, s.context.xyoffset.ofy / 16.0f);
+            // a sprite that paints no pixel on the GS is not drawn (at the internal scale it still got host pixels: more
+            // of the additive bubbles than the PS2 shows)
+            if (!coversX || !coversY)
+                return;
             // the texel coordinates of the first and last pixel the GS covers (pixel n is covered when lo <= n < hi);
             // a sprite covering no pixel on the GS keeps its whole range
             const auto sampled = [](float p0, float p1, float t0, float t1, float &lo, float &hi)
@@ -1821,6 +1870,15 @@ struct GSHwBackend::Impl
             SpriteEdges cur{{xs[0], xs[1]}, {ys[0], ys[1]}, {us[0], us[1]}, {vs[0], vs[1]}};
             if (lastSprite.batch == batchSerial && lastSprite.end == pending.size() && lastSprite.end >= 6)
                 openSharedSide(lastSprite.edges, cur, &pending[lastSprite.end - 6], cu0, cu1, cv0, cv1);
+            // A sprite that shrinks its texture a lot (particles: God of War II's bubbles are 2-pixel sprites of a 32-texel
+            // bubble) is sampled by the GS at one or two texels; clamped to those, at the internal scale it showed a cut
+            // piece of the picture (square fragments instead of round bubbles). Such sprites keep the whole range, as in
+            // PCSX2; the bloom's halvings (2 texels per pixel) stay clamped.
+            constexpr float kShrinkUnclamped = 4.0f;
+            if (a.x != c.x && std::fabs((u1 - u0) / (c.x - a.x)) > kShrinkUnclamped)
+                cu0 = -1e30f, cu1 = 1e30f;
+            if (a.y != c.y && std::fabs((v1 - v0) / (c.y - a.y)) > kShrinkUnclamped)
+                cv0 = -1e30f, cv1 = 1e30f;
             const int order[6][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 1}};
             for (const auto &o : order)
             {
@@ -2173,6 +2231,9 @@ struct GSHwBackend::Impl
             g.Uniform1i(locRtTex24, !(src || rsrc) ? 0 : c.tex0.psm == GS_PSM_CT24 ? 1 : family16(c.tex0.psm) ? 2 : 0);
             g.Uniform2f(locRtClamp, src && (c.clamp & 3u) == 1u ? 1.0f : 0.0f, src && ((c.clamp >> 2) & 3u) == 1u ? 1.0f : 0.0f);
             g.Uniform1f(locPxScale, scale);
+            // GOW_ANISO=2..16: anisotropic filtering of uploaded textures (render targets are read as the GS reads them)
+            static const int aniso = [] { const char *v = std::getenv("GOW_ANISO"); return v ? std::clamp(std::atoi(v), 1, 16) : 1; }();
+            g.Uniform1i(locAniso, !(src || rsrc || zsrc) && s.linearFilter ? aniso : 1);
             g.Uniform1i(locReinterp, rsrc ? 1 : 0);
             if (rsrc)
                 setupReinterpret(s, *rsrc);
