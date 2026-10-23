@@ -16,7 +16,7 @@ public:
 
 private:
     bool m_initialized = false;
-    bool m_visible = true;
+    bool m_visible = false; // GoW2-Port: hidden at startup (a player does not need it); F1 opens it
     bool m_showRegisters = true;
     unsigned int m_memoryAddress = 0x00100000u;
     unsigned int m_memoryBytes = 0x100u;

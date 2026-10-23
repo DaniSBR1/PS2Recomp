@@ -826,9 +826,15 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        // GOW-Port: window size. GOW_WINDOW=<w>x<h>; default 1920x1080. The image is always fitted at 16:9
+        // GOW-Port: GOW_VSYNC=1 waits for the monitor's refresh on every swap (raylib only applies the hint when the
+        // window is created); the 60 FPS limiter below stays on either way.
+        {
+            const char *vsync = std::getenv("GOW_VSYNC");
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE | (vsync && *vsync == '1' ? FLAG_VSYNC_HINT : 0u));
+        }
+        // GOW-Port: window size. GOW_WINDOW=<w>x<h>; default 1920x1080. The image is fitted at 16:9 or 4:3
         // (gs_host_present.cpp); the window stays resizable and is shrunk to the monitor when it does not fit.
+        // GOW_FULLSCREEN=1 starts in borderless full screen (what F12 toggles).
         {
             int width = 1920, height = 1080;
             if (const char *size = std::getenv("GOW_WINDOW"))
@@ -848,6 +854,9 @@ bool PS2Runtime::initialize(const char *title)
                     SetWindowSize(static_cast<int>(width * scale), static_cast<int>(height * scale));
                     SetWindowPosition(0, 0);
                 }
+                const char *fullscreen = std::getenv("GOW_FULLSCREEN");
+                if (fullscreen && *fullscreen == '1')
+                    ToggleBorderlessWindowed();
             }
         }
 #endif
