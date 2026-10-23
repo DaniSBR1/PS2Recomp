@@ -71,6 +71,12 @@ void main()
            + tex(vec2(tc12.x, tc3.y)) * (w12.x * w3.y);
     float norm = (w12.x * w0.y) + (w0.x * w12.y) + (w12.x * w12.y) + (w3.x * w12.y) + (w12.x * w3.y);
     c /= norm;
+    if (sharpen <= 0.0)
+    {
+        // GOW_SHARPEN=0: bicubic only
+        finalColor = vec4(clamp(c.rgb, 0.0, 1.0), 1.0);
+        return;
+    }
     // contrast-adaptive sharpen from the four direct neighbours of the nearest source texel
     vec2 px = 1.0 / srcSize;
     vec3 n = tex(fragTexCoord + vec2(0.0, -px.y)).rgb, s = tex(fragTexCoord + vec2(0.0, px.y)).rgb;
@@ -116,6 +122,129 @@ void main()
             }
         }
         return g_scaler.id != 0u ? &g_scaler : nullptr;
+    }
+
+    // GoW2-Port: FXAA (GOW_FXAA=1), after PCSX2's fxaa.fx (GPLv3+), itself adapted from Timothy Lottes' FXAA 3.11, with
+    // PCSX2's settings: edge threshold 0.063, minimum 0, no subpixel blending (edges only, textures stay sharp) and 13
+    // search steps. As in PCSX2 it runs on the frame at the internal resolution, before the scaler takes it to the window.
+    const char *kFxaaFragment = R"GLSL(
+#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec2 rcpFrame;
+out vec4 finalColor;
+
+const float kEdgeThreshold = 0.063;
+const float kEdgeThresholdMin = 0.0;
+const float kSubpix = 0.0;
+const float kSteps[13] = float[](1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0);
+
+vec4 at(vec2 p) { return textureLod(texture0, p, 0.0); }
+float luma(vec4 c) { return dot(c.rgb, vec3(0.2126729, 0.7151522, 0.0721750)); }
+float lumaAt(vec2 p) { return luma(at(p)); }
+float lumaOff(vec2 p, vec2 o) { return luma(at(p + o * rcpFrame)); }
+
+void main()
+{
+    vec2 posM = fragTexCoord;
+    vec4 rgbyM = at(posM);
+    float lumaM = luma(rgbyM);
+    float lumaS = lumaOff(posM, vec2(0.0, 1.0)), lumaE = lumaOff(posM, vec2(1.0, 0.0));
+    float lumaN = lumaOff(posM, vec2(0.0, -1.0)), lumaW = lumaOff(posM, vec2(-1.0, 0.0));
+    float rangeMax = max(max(lumaN, lumaW), max(lumaE, max(lumaS, lumaM)));
+    float rangeMin = min(min(lumaN, lumaW), min(lumaE, min(lumaS, lumaM)));
+    float range = rangeMax - rangeMin;
+    if (range < max(kEdgeThresholdMin, rangeMax * kEdgeThreshold))
+    {
+        finalColor = vec4(rgbyM.rgb, 1.0);
+        return;
+    }
+    float lumaNW = lumaOff(posM, vec2(-1.0, -1.0)), lumaSE = lumaOff(posM, vec2(1.0, 1.0));
+    float lumaNE = lumaOff(posM, vec2(1.0, -1.0)), lumaSW = lumaOff(posM, vec2(-1.0, 1.0));
+    float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;
+    float edgeHorz = abs(-2.0 * lumaW + lumaNW + lumaSW) + abs(-2.0 * lumaM + lumaNS) * 2.0 + abs(-2.0 * lumaE + lumaNE + lumaSE);
+    float edgeVert = abs(-2.0 * lumaS + lumaSW + lumaSE) + abs(-2.0 * lumaM + lumaWE) * 2.0 + abs(-2.0 * lumaN + lumaNW + lumaNE);
+    bool horzSpan = edgeHorz >= edgeVert;
+    float lengthSign = horzSpan ? rcpFrame.y : rcpFrame.x;
+    if (!horzSpan)
+    {
+        lumaN = lumaW;
+        lumaS = lumaE;
+    }
+    float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;
+    bool pairN = abs(gradientN) >= abs(gradientS);
+    float gradient = max(abs(gradientN), abs(gradientS));
+    if (pairN)
+        lengthSign = -lengthSign;
+    float lumaNN = (pairN ? lumaN : lumaS) + lumaM;
+
+    // walk along the edge both ways until the luma leaves the edge's pair
+    vec2 posB = posM;
+    vec2 offNP = horzSpan ? vec2(rcpFrame.x, 0.0) : vec2(0.0, rcpFrame.y);
+    if (horzSpan)
+        posB.y += lengthSign * 0.5;
+    else
+        posB.x += lengthSign * 0.5;
+    float gradientScaled = gradient * 0.25;
+    bool lumaMLTZero = lumaM - lumaNN * 0.5 < 0.0;
+    vec2 posN = posB - offNP * kSteps[0], posP = posB + offNP * kSteps[0];
+    float lumaEndN = lumaAt(posN) - lumaNN * 0.5, lumaEndP = lumaAt(posP) - lumaNN * 0.5;
+    bool doneN = abs(lumaEndN) >= gradientScaled, doneP = abs(lumaEndP) >= gradientScaled;
+    for (int i = 1; i < 13 && !(doneN && doneP); ++i)
+    {
+        if (!doneN)
+        {
+            posN -= offNP * kSteps[i];
+            lumaEndN = lumaAt(posN) - lumaNN * 0.5;
+            doneN = abs(lumaEndN) >= gradientScaled;
+        }
+        if (!doneP)
+        {
+            posP += offNP * kSteps[i];
+            lumaEndP = lumaAt(posP) - lumaNN * 0.5;
+            doneP = abs(lumaEndP) >= gradientScaled;
+        }
+    }
+    float dstN = horzSpan ? posM.x - posN.x : posM.y - posN.y;
+    float dstP = horzSpan ? posP.x - posM.x : posP.y - posM.y;
+    bool directionN = dstN < dstP;
+    bool goodSpan = ((directionN ? lumaEndN : lumaEndP) < 0.0) != lumaMLTZero;
+    float pixelOffset = goodSpan ? min(dstN, dstP) * (-1.0 / (dstN + dstP)) + 0.5 : 0.0;
+
+    float subpixC = clamp(abs(((lumaNS + lumaWE) * 2.0 + lumaNW + lumaSW + lumaNE + lumaSE) / 12.0 - lumaM) / range, 0.0, 1.0);
+    float subpixF = (-2.0 * subpixC + 3.0) * subpixC * subpixC;
+    pixelOffset = max(pixelOffset, subpixF * subpixF * kSubpix);
+    vec2 pos = posM;
+    if (horzSpan)
+        pos.y += pixelOffset * lengthSign;
+    else
+        pos.x += pixelOffset * lengthSign;
+    finalColor = vec4(at(pos).rgb, 1.0);
+}
+)GLSL";
+
+    Shader g_fxaa{};
+    int g_fxaaRcpFrame = -1;
+    RenderTexture2D g_fxaaTarget{};
+
+    Shader *fxaaShader()
+    {
+        static const bool on = [] { const char *v = std::getenv("GOW_FXAA"); return v && *v == '1'; }();
+        static bool tried = false;
+        if (on && !tried)
+        {
+            tried = true;
+            g_fxaa = LoadShaderFromMemory(nullptr, kFxaaFragment);
+            if (g_fxaa.id != 0u && g_fxaa.id != rlGetShaderIdDefault())
+                g_fxaaRcpFrame = GetShaderLocation(g_fxaa, "rcpFrame");
+            else
+            {
+                std::fprintf(stderr, "[gs-present] FXAA shader failed, FXAA off\n");
+                g_fxaa = {};
+            }
+        }
+        return g_fxaa.id != 0u ? &g_fxaa : nullptr;
     }
 
     // GoW2-Port: performance overlay (F10), after PCSX2's PerformanceMetrics + ImGuiManager::DrawPerformanceOverlay
@@ -262,12 +391,14 @@ void GSHostPresentation::blankFallback()
 {
     if (!uploadedBlank)
     {
+        // GoW2-Port: black, as a PS2 shows with its video output off (boot, loading); it was a magenta debug placeholder,
+        // a pink screen every time the game started
         for (size_t offset = 0u; offset < upload.size(); offset += 4u)
         {
-            upload[offset] = MAGENTA.r;
-            upload[offset + 1u] = MAGENTA.g;
-            upload[offset + 2u] = MAGENTA.b;
-            upload[offset + 3u] = MAGENTA.a;
+            upload[offset] = 0u;
+            upload[offset + 1u] = 0u;
+            upload[offset + 2u] = 0u;
+            upload[offset + 3u] = 255u;
         }
         UpdateTexture(fallback, upload.data());
         uploadedBlank = true;
@@ -327,7 +458,7 @@ GSHostPresentation::View GSHostPresentation::prepare(GS &gs, uint64_t vsyncTick)
                 return current;
             }
         }
-        blankFallback(); // PMODE apagado conserva el placeholder magenta de RAM.
+        blankFallback(); // PMODE off: black placeholder (see blankFallback)
         return current;
     }
     if (!needsLatch && uploaded)
@@ -422,18 +553,48 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         selected = prepare(gs, vsyncTick);
     }
     g_perfOverlay.update(vsyncTick, gs.privilegedRegisters());
+    // GoW2-Port: FXAA into a target of the frame's size, which the scaler then reads instead of the frame (a render
+    // texture is stored upside down, hence the flipped source rectangle below)
+    Texture2D frameTexture = selected.texture;
+    bool frameFlipped = false;
+    if (Shader *fxaa = fxaaShader(); fxaa && selected.width > 0u && selected.height > 0u)
+    {
+        const int width = static_cast<int>(selected.width), height = static_cast<int>(selected.height);
+        if (g_fxaaTarget.id == 0u || g_fxaaTarget.texture.width != width || g_fxaaTarget.texture.height != height)
+        {
+            if (g_fxaaTarget.id != 0u)
+                UnloadRenderTexture(g_fxaaTarget);
+            g_fxaaTarget = LoadRenderTexture(width, height);
+            SetTextureFilter(g_fxaaTarget.texture, TEXTURE_FILTER_BILINEAR);
+        }
+        if (g_fxaaTarget.id != 0u)
+        {
+            const float rcpFrame[2] = {1.0f / static_cast<float>(selected.texture.width), 1.0f / static_cast<float>(selected.texture.height)};
+            const Rectangle frameRect{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
+            SetShaderValue(*fxaa, g_fxaaRcpFrame, rcpFrame, SHADER_UNIFORM_VEC2);
+            SetTextureFilter(selected.texture, TEXTURE_FILTER_BILINEAR);
+            BeginTextureMode(g_fxaaTarget);
+            ClearBackground(BLACK);
+            BeginShaderMode(*fxaa);
+            DrawTexturePro(selected.texture, frameRect, frameRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            EndShaderMode();
+            EndTextureMode();
+            frameTexture = g_fxaaTarget.texture;
+            frameFlipped = true;
+        }
+    }
     BeginDrawing();
     ClearBackground(BLACK);
     const float sourceWidth = static_cast<float>(std::max<uint32_t>(1u, selected.width));
     const float sourceHeight = static_cast<float>(std::max<uint32_t>(1u, selected.height));
     const float screenWidth = static_cast<float>(GetScreenWidth());
     const float screenHeight = static_cast<float>(GetScreenHeight());
-    // GOW-Port: a PS2 frame (e.g. 512x448) is shown at the TV's aspect, not with square pixels:
-    // always 16:9 (the game renders widescreen, see gow_overrides.cpp; 4:3 is not supported any more).
-    constexpr float displayAspect = 16.0f / 9.0f;
+    // GOW-Port: a PS2 frame (e.g. 512x448) is shown at the TV's aspect, not with square pixels: 16:9 (the game renders
+    // widescreen, see the game's override), or 4:3 with GOW_ASPECT=4:3 (the override then turns the game's widescreen off).
+    static const float displayAspect = [] { const char *v = std::getenv("GOW_ASPECT"); return v && std::strcmp(v, "4:3") == 0 ? 4.0f / 3.0f : 16.0f / 9.0f; }();
     const float destinationWidth = std::min(screenWidth, screenHeight * displayAspect);
     const float destinationHeight = destinationWidth / displayAspect;
-    const Rectangle source{0.0f, 0.0f, sourceWidth, sourceHeight};
+    const Rectangle source{0.0f, 0.0f, sourceWidth, frameFlipped ? -sourceHeight : sourceHeight};
     const Rectangle destination{(screenWidth - destinationWidth) * 0.5f,
                                 (screenHeight - destinationHeight) * 0.5f,
                                 destinationWidth, destinationHeight};
@@ -443,7 +604,7 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
     const bool magnified = sourceWidth < destinationWidth || sourceHeight < destinationHeight;
     Shader *scaler = scalerShader();
     if (!scaler)
-        SetTextureFilter(selected.texture, TEXTURE_FILTER_BILINEAR);
+        SetTextureFilter(frameTexture, TEXTURE_FILTER_BILINEAR);
     if (scaler)
     {
         const float size[2] = {sourceWidth, sourceHeight};
@@ -452,10 +613,10 @@ GSHostPresentation::View GSHostPresentation::renderFrame(GS &gs, uint64_t vsyncT
         SetShaderValue(*scaler, g_scalerSharpen, &sharpen, SHADER_UNIFORM_FLOAT);
         const float plain = magnified ? 0.0f : 1.0f;
         SetShaderValue(*scaler, g_scalerPlain, &plain, SHADER_UNIFORM_FLOAT);
-        SetTextureFilter(selected.texture, TEXTURE_FILTER_BILINEAR);
+        SetTextureFilter(frameTexture, TEXTURE_FILTER_BILINEAR);
         BeginShaderMode(*scaler);
     }
-    DrawTexturePro(selected.texture, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+    DrawTexturePro(frameTexture, source, destination, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
     if (scaler)
         EndShaderMode();
     if (overlay)
