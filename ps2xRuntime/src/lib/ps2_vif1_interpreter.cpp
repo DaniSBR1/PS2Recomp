@@ -33,6 +33,105 @@ enum VIFCmd : uint8_t
     VIF_DIRECTHL = 0x51,
 };
 
+namespace
+{
+    // GOW-Port: UNPACK fast path (see its use in processVIF1Data). Decode: one vector of C components of VL format.
+    template <uint32_t C, uint32_t VL>
+    struct VifDecode
+    {
+        static constexpr uint32_t kStride = C * (VL == 0u ? 4u : (VL == 1u ? 2u : 1u));
+        static void one(uint8_t *dst, const uint8_t *src, bool zeroExtend)
+        {
+            uint32_t v[4];
+            if constexpr (C == 3u)
+                std::memcpy(&v[3], dst + 12, 4); // V3 leaves W as it was
+            for (uint32_t c = 0; c < C; ++c)
+            {
+                if constexpr (VL == 0u)
+                    std::memcpy(&v[c], src + c * 4u, 4);
+                else if constexpr (VL == 1u)
+                {
+                    uint16_t raw;
+                    std::memcpy(&raw, src + c * 2u, 2);
+                    v[c] = zeroExtend ? raw : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                }
+                else
+                    v[c] = zeroExtend ? src[c] : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(src[c])));
+            }
+            if constexpr (C == 1u)
+                v[1] = v[2] = v[3] = v[0];
+            else if constexpr (C == 2u)
+            {
+                v[2] = v[0];
+                v[3] = v[1];
+            }
+            std::memcpy(dst, v, 16);
+        }
+    };
+
+    struct VifDecodeV4_5 // V4-5 expands RGB to bits 3..7 and alpha to bit 7
+    {
+        static constexpr uint32_t kStride = 2u;
+        static void one(uint8_t *dst, const uint8_t *src, bool)
+        {
+            uint16_t packed;
+            std::memcpy(&packed, src, 2);
+            const uint32_t v[4] = {(packed & 0x001Fu) << 3u, (packed & 0x03E0u) >> 2u, (packed & 0x7C00u) >> 7u,
+                                   (packed & 0x8000u) >> 8u};
+            std::memcpy(dst, v, 16);
+        }
+    };
+
+    // The STCYCL write pattern without the general loop's per-vector division: with CL >= WL, WL vectors are written
+    // at the start of every block of CL; with CL < WL, the vectors past CL in each block of WL have no source data and
+    // get the ROW register (what the general loop does for them without a mask).
+    template <typename Decode>
+    void vif1UnpackCycled(uint8_t *vuData, uint32_t vuAddr, uint32_t count, const uint8_t *src, bool zeroExtend,
+                          uint32_t cl, uint32_t wl, const void *row)
+    {
+        uint32_t cyclePos = 0u, blockBase = vuAddr;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            uint8_t *dst = vuData + (((cl >= wl ? blockBase + cyclePos : vuAddr + i)) & 0x3FFu) * 16u;
+            if (cl >= wl || cyclePos < cl)
+            {
+                Decode::one(dst, src, zeroExtend);
+                src += Decode::kStride;
+            }
+            else
+                std::memcpy(dst, row, 16);
+            if (++cyclePos == wl)
+            {
+                cyclePos = 0u;
+                blockBase += cl;
+            }
+        }
+    }
+
+    // False for the formats the general loop treats as unknown (VL 3 with VN < 3).
+    bool vif1UnpackFast(uint8_t *vuData, uint32_t vuAddr, uint32_t count, const uint8_t *src, uint32_t vn, uint32_t vl,
+                        bool zeroExtend, uint32_t cl, uint32_t wl, const void *row)
+    {
+        switch ((vl << 2) | vn)
+        {
+        case 0x0: vif1UnpackCycled<VifDecode<1, 0>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x1: vif1UnpackCycled<VifDecode<2, 0>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x2: vif1UnpackCycled<VifDecode<3, 0>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x3: vif1UnpackCycled<VifDecode<4, 0>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x4: vif1UnpackCycled<VifDecode<1, 1>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x5: vif1UnpackCycled<VifDecode<2, 1>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x6: vif1UnpackCycled<VifDecode<3, 1>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x7: vif1UnpackCycled<VifDecode<4, 1>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x8: vif1UnpackCycled<VifDecode<1, 2>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0x9: vif1UnpackCycled<VifDecode<2, 2>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0xA: vif1UnpackCycled<VifDecode<3, 2>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0xB: vif1UnpackCycled<VifDecode<4, 2>>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        case 0xF: vif1UnpackCycled<VifDecodeV4_5>(vuData, vuAddr, count, src, zeroExtend, cl, wl, row); return true;
+        default: return false;
+        }
+    }
+}
+
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -629,7 +728,27 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         }
                 }
             }
-            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+            // GOW-Port: fast path for the common UNPACK: no mask and no ROW addition (STMOD 0, or V4-5, which never adds),
+            // any CL/WL (~15-20 % of the VIF1 thread was the general loop below).
+            // GOW_VIF_UNPACK_VERIFY=1 also runs the general loop and compares both results.
+            static const bool unpackVerify = std::getenv("GOW_VIF_UNPACK_VERIFY") != nullptr;
+            const bool fitsBuffer = m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes;
+            std::vector<uint8_t> verifyBefore, verifyFast;
+            bool linearDone = false;
+            if (fitsBuffer && !maskEnable && ((vl == 3u && vn == 3u) || (vif1_regs.mode & 3u) == 0u))
+            {
+                if (unpackVerify)
+                    verifyBefore.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                linearDone = vif1UnpackFast(m_vu1Data, vuAddr, writeVectorCount, data + pos, vn, vl, zeroExtend, cl, wl,
+                                            vif1_regs.row);
+                if (linearDone && unpackVerify)
+                {
+                    verifyFast.assign(m_vu1Data, m_vu1Data + PS2_VU1_DATA_SIZE);
+                    std::memcpy(m_vu1Data, verifyBefore.data(), PS2_VU1_DATA_SIZE);
+                    linearDone = false;
+                }
+            }
+            if (!linearDone && fitsBuffer)
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
@@ -845,6 +964,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
                 }
+            }
+            if (!verifyFast.empty())
+            {
+                static unsigned checked = 0u, mismatches = 0u;
+                ++checked;
+                if (std::memcmp(verifyFast.data(), m_vu1Data, PS2_VU1_DATA_SIZE) != 0 && ++mismatches <= 20u)
+                    std::fprintf(stderr, "[vif1-unpack-verify] MISMATCH vn=%u vl=%u num=%u addr=%03x zext=%u\n",
+                                 static_cast<unsigned>(vn), static_cast<unsigned>(vl), writeVectorCount, vuAddr,
+                                 zeroExtend ? 1u : 0u);
+                if (checked % 200000u == 0u)
+                    std::fprintf(stderr, "[vif1-unpack-verify] %u checked, %u mismatches\n", checked, mismatches);
             }
             pos += totalBytes;
 

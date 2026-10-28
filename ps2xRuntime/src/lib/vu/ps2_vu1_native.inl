@@ -681,8 +681,16 @@ VU1Interpreter::NativeState::Slot &VU1NativeAccess::slotFor(VU1Interpreter &vu, 
                         sl.scalar[sl.scalarCount++] = {i, static_cast<uint8_t>(bt.dec[i].lowerUsage.latency),
                                                        bt.dec[i].lowerUsage.pipeline == VU1Interpreter::PipelineFdiv};
             }
-            else if (ns.diag)
-                ++ns.missPcs[pc];
+            else
+            {
+                if (ns.diag)
+                    ++ns.missPcs[pc];
+                if (ns.capturedGeneration != ns.generation)
+                {
+                    ns.capturedGeneration = ns.generation;
+                    captureMicrocode(code, codeSize);
+                }
+            }
         }
     }
     return sl;

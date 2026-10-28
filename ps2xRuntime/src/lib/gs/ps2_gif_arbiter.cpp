@@ -63,17 +63,33 @@ bool GifArbiter::trackPath3Packet(const uint8_t *data, uint32_t sizeBytes)
     return containsImage;
 }
 
+namespace
+{
+    thread_local bool t_gifArbiterDirect = false; // inside a direct PATH1 call (see submit)
+}
+
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16 || !m_processFn || pathId < GifPathId::Path1 || pathId > GifPathId::Path3)
         return;
 
+    // GOW-Port: every PATH1 packet (XGKICK) is drained right after it is submitted (PS2Memory::submitGifPacket). With
+    // nothing else queued, the drain would process it first anyway (PATH1 has the highest priority), so it goes to the
+    // GS straight from the VU1's buffer: no copy into the queue, no allocation, no sort. What its callback queues is
+    // drained after it, as before.
+    if (pathId == GifPathId::Path1 && m_queue.empty() && !t_gifArbiterDirect)
+    {
+        t_gifArbiterDirect = true;
+        m_processFn(pathId, data, sizeBytes);
+        t_gifArbiterDirect = false;
+        return;
+    }
+
     GifArbiterPacket pkt;
     pkt.pathId = pathId;
     pkt.path2DirectHl = (pathId == GifPathId::Path2) && path2DirectHl;
     pkt.path3Image = (pathId == GifPathId::Path3) && trackPath3Packet(data, sizeBytes);
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    pkt.data.assign(data, data + sizeBytes); // GOW-Port: not resize + memcpy (it zero-filled the buffer first)
     m_queue.push_back(std::move(pkt));
 }
 
@@ -86,11 +102,11 @@ void GifArbiter::drain()
     {
         // GOW-Port: la excepción DIRECTHL/IMAGE no es un orden débil estricto y no puede
         // usarse como comparador de stable_sort. Agrupar solo por path conserva sus FIFO.
-        std::stable_sort(m_queue.begin(), m_queue.end(),
-                         [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                         {
-                             return pathPriority(a.pathId) < pathPriority(b.pathId);
-                         });
+        const auto byPath = [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+        { return pathPriority(a.pathId) < pathPriority(b.pathId); };
+        // GOW-Port: usually one packet, or already in path order: stable_sort allocates its buffer anyway
+        if (!std::is_sorted(m_queue.begin(), m_queue.end(), byPath))
+            std::stable_sort(m_queue.begin(), m_queue.end(), byPath);
         const size_t count = m_queue.size();
         size_t path2Begin = 0u;
         while (path2Begin < count && m_queue[path2Begin].pathId == GifPathId::Path1)

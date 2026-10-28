@@ -1,6 +1,29 @@
 // GOW-Port: native display and GS-status service (see runtime/gs/gs_display.h).
 #include "runtime/gs/gs_display.h"
+#include "runtime/gs/gs_csr_events.h"
 #include "runtime/ps2_memory.h"
+
+#include <atomic>
+
+namespace ps2_gs_csr_events
+{
+    namespace
+    {
+        std::atomic<uint32_t> g_counts[2] = {};
+    }
+
+    void noteSet(uint64_t previous, uint32_t bits)
+    {
+        for (uint32_t bit = 0u; bit < 2u; ++bit)
+            if ((bits & (1u << bit)) != 0u && (previous & (1ull << bit)) == 0u)
+                g_counts[bit].fetch_add(1u, std::memory_order_acq_rel);
+    }
+
+    uint32_t count(uint32_t bit)
+    {
+        return g_counts[bit & 1u].load(std::memory_order_acquire);
+    }
+}
 
 namespace ps2_gs_display
 {

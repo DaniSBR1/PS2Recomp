@@ -465,7 +465,12 @@ public:
     {
         bool vif1 = false; // false: GIF PATH3
         std::vector<uint8_t> data;
+        // GOW-Port: GOW_GS_DISPLAY_ASINCRONO=1: a display register store (PMODE, DISPFB, ...) queued in order with the
+        // DMA instead of making the EE wait for the worker (address != 0; no data).
+        uint32_t displayAddress = 0;
+        uint64_t displayValue = 0;
     };
+    void applyGsDisplayStore(uint32_t address, uint64_t value);
     struct GsWorkerJob
     {
         std::vector<GsWorkerItem> items;

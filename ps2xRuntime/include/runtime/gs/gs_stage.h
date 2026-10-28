@@ -24,6 +24,8 @@ namespace ps2_gs_stage
 
     // Queues a copy of the packet (blocks while too much is queued, so the worker cannot run far ahead).
     void push(GifPathId path, const uint8_t *data, uint32_t size);
+    // GOW-Port: queues a call that runs on the stage thread after the packets queued before it.
+    void pushCall(std::function<void()> call);
 
     // Returns when every queued packet has been processed. No-op on the stage thread itself.
     void waitIdle();

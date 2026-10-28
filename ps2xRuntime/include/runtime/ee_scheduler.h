@@ -267,6 +267,9 @@ public:
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
     static constexpr uint32_t kGuestDispatchCycles = 8u;
     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
+    // GOW-Port: accountCycles hands the EE timers and the IOP their cycles in batches of this many (a timer interrupt
+    // can come up to kSideBatchCycles - 1 EE cycles late, ~0.2 us; the IOP already runs in batches of 4096).
+    static constexpr uint64_t kSideBatchCycles = 64ull;
 
     explicit EeScheduler(PS2Runtime &runtime);
     ~EeScheduler();
@@ -280,6 +283,7 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    void flushSideCycles() noexcept;
     // GOW-Port: for a guest busy-wait that never blocks (the movie player): when guest time has fallen behind the
     // host clock (a scheduled event's host deadline has passed but its guest cycle is not reached), account the
     // missing cycles (at most maxCycles) so guest time, EE timers and the IOP keep real time. Returns cycles added.
@@ -438,6 +442,7 @@ private:
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
+    uint64_t m_sideCycles = 0; // EE cycles not yet handed to the timers and the IOP (see kSideBatchCycles)
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};

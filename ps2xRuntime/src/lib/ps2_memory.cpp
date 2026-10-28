@@ -1529,7 +1529,33 @@ bool PS2Memory::isGsStatusRegister(uint32_t address) noexcept
            (address & 0x1FFFFFFFu) == 0x12001000u;
 }
 
+// GOW-Port: GOW_GS_DISPLAY_ASINCRONO=1. With the GS worker, a display register store used to wait for the worker and
+// the GS frontend stage to finish everything queued (the new DISPFB must not be shown before the frame drawn into it).
+// God of War II sets the display once per frame, so the EE waited for the whole frame's VU1 work there. The store is
+// now queued behind that work instead (worker job, then the stage), and the EE goes on building the next frame.
+// EE reads of the display registers still sync first (needsGsWorkerSync), so they see every queued store.
 void PS2Memory::gsDisplayStore(uint32_t address, uint64_t value)
+{
+    static const bool async = [] { const char *v = std::getenv("GOW_GS_DISPLAY_ASINCRONO"); return v && v[0] == '1'; }();
+    if (async && m_gsWorkerEnabled && !onGsWorkerThread() && !ps2_gs_stage::onStageThread())
+    {
+        GsWorkerJob job;
+        job.fbrst = m_fbrstProvider ? m_fbrstProvider() : 0u;
+        GsWorkerItem item;
+        item.displayAddress = address;
+        item.displayValue = value;
+        job.items.push_back(std::move(item));
+        {
+            std::lock_guard<std::mutex> lock(m_gsWorkerMutex);
+            m_gsWorkerJobs.push_back(std::move(job));
+        }
+        m_gsWorkerCv.notify_one();
+        return;
+    }
+    applyGsDisplayStore(address, value);
+}
+
+void PS2Memory::applyGsDisplayStore(uint32_t address, uint64_t value)
 {
     GSDisplayState state = ps2_gs_display::display(*this);
     switch (address & 0x1FFFFFFFu)
@@ -1777,6 +1803,37 @@ bool PS2Memory::processScratchpadChain(uint32_t channelBase, uint32_t chcr)
 
 static void gsWorkerTrace(const char *what, size_t bytes);
 
+// GOW-Port: byte buffers of the DMA sends, reused. Every send built a new vector from empty, a few MB per frame in God of
+// War II (the VU1 chain): ~20 reallocations with copies and, for the big blocks, memory taken from and given back to
+// Windows each time. That got slower as the heap aged, up to ~27 % of the EE thread after 10 minutes (59 -> 51 FPS).
+// The GS worker hands each buffer back once it has processed it, and the next send starts with its capacity.
+namespace
+{
+    std::mutex g_dmaBufferMutex;
+    std::vector<std::vector<uint8_t>> g_dmaBuffers;
+
+    std::vector<uint8_t> takeDmaBuffer()
+    {
+        std::lock_guard<std::mutex> lock(g_dmaBufferMutex);
+        if (g_dmaBuffers.empty())
+            return {};
+        std::vector<uint8_t> buffer = std::move(g_dmaBuffers.back());
+        g_dmaBuffers.pop_back();
+        buffer.clear();
+        return buffer;
+    }
+
+    void recycleDmaBuffer(std::vector<uint8_t> &&buffer)
+    {
+        constexpr size_t kMaxKept = 16u, kMaxCapacity = 64u << 20;
+        if (buffer.capacity() == 0u || buffer.capacity() > kMaxCapacity)
+            return;
+        std::lock_guard<std::mutex> lock(g_dmaBufferMutex);
+        if (g_dmaBuffers.size() < kMaxKept)
+            g_dmaBuffers.push_back(std::move(buffer));
+    }
+}
+
 // GOW-Port: native DMA data path (docs/native-port.md, step 2). Bytes of guest memory (RAM or scratchpad) in order, with
 // the RAM wrap of the former transfer loops.
 void PS2Memory::appendGuestBytes(uint32_t address, uint32_t bytes, std::vector<uint8_t> &out)
@@ -1806,7 +1863,7 @@ void PS2Memory::appendGuestBytes(uint32_t address, uint32_t bytes, std::vector<u
 
 void PS2Memory::sendDma(DmaPath path, uint32_t address, uint32_t qwc)
 {
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> bytes = takeDmaBuffer();
     appendGuestBytes(address, qwc * 16u, bytes);
     deliverDma(path, std::move(bytes));
 }
@@ -1822,7 +1879,7 @@ void PS2Memory::sendDmaChain(DmaPath path, uint32_t tagAddress)
     const bool transferTags = path != DmaPath::Gif && config != m_ioRegisters.end() && (config->second & 0x40u) != 0u;
     uint32_t returnStack[2] = {};
     uint32_t depth = 0u;
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> bytes = takeDmaBuffer();
     int tags = 0;
     for (; tags < kMaxTags; ++tags)
     {
@@ -1926,6 +1983,7 @@ void PS2Memory::deliverDma(DmaPath path, std::vector<uint8_t> &&bytes)
     if (path == DmaPath::Vif0)
     {
         processVIF0Data(bytes.data(), size);
+        recycleDmaBuffer(std::move(bytes));
         return;
     }
     if (m_gsWorkerEnabled)
@@ -1979,6 +2037,17 @@ void PS2Memory::runGsWorkerJob(GsWorkerJob &job)
     m_gsWorkerJobFbrst = job.fbrst;
     for (GsWorkerItem &item : job.items)
     {
+        if (item.displayAddress != 0u)
+        {
+            // behind the packets of the jobs before it, which the stage may still be processing
+            const uint32_t address = item.displayAddress;
+            const uint64_t value = item.displayValue;
+            if (ps2_gs_stage::running())
+                ps2_gs_stage::pushCall([this, address, value] { applyGsDisplayStore(address, value); });
+            else
+                applyGsDisplayStore(address, value);
+            continue;
+        }
         const uint32_t size = static_cast<uint32_t>(item.data.size());
         if (item.vif1)
         {
@@ -2020,6 +2089,8 @@ void PS2Memory::gsWorkerLoop()
         {
             std::fprintf(stderr, "[gs-worker] job failed: %s\n", e.what());
         }
+        for (GsWorkerItem &item : job.items)
+            recycleDmaBuffer(std::move(item.data));
         if (m_gsWorkerWake && (gs_regs.csr.load(std::memory_order_acquire) & 0x3u) != 0u)
             m_gsWorkerWake();
     }
@@ -2125,6 +2196,12 @@ bool PS2Memory::needsGsWorkerSync(uint32_t address) const
     if (isScratchpad(address))
         return false;
     const uint32_t phys = address & 0x1FFFFFFFu;
+    // GOW-Port: GOW_GS_DISPLAY_ASINCRONO=1 (see gsDisplayStore): GS_CSR is read and acknowledged as on the console, with
+    // whatever the GS has done so far (an atomic; the FINISH acknowledge is an atomic read-modify-write). The GS interrupt
+    // handler reads it on every FINISH, and with the next frame already queued it waited for that whole frame.
+    static const bool asyncCsr = [] { const char *v = std::getenv("GOW_GS_DISPLAY_ASINCRONO"); return v && v[0] == '1'; }();
+    if (asyncCsr && (phys & ~0xFu) == 0x12001000u)
+        return false;
     return isGsPrivReg(address) || isGsPrivReg(phys) ||
            (phys >= 0x10003000u && phys < 0x10004000u) || // GIF and VIF0/VIF1 registers
            (phys >= 0x10005000u && phys < 0x10007000u) || // VIF1 / GIF FIFOs

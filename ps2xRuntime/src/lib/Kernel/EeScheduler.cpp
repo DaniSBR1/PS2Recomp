@@ -2,6 +2,7 @@
 
 #include "ps2_log.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/gs/gs_csr_events.h"
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
@@ -118,6 +119,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
+    m_sideCycles = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -412,8 +414,21 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     // nothing advanced it: God of War II's loader (0x18CF70) spins until Count passes a per-frame deadline.
     if (g_countContext != nullptr)
         g_countContext->cop0_count = static_cast<uint32_t>(m_eeCycle);
-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
+    // GOW-Port: this runs at every guest call and loop back edge (millions of times per second, 8 cycles each); the
+    // timer and IOP accounting behind it were ~10 % of the EE thread, mostly call overhead. They now get batches.
+    m_sideCycles += elapsed;
+    if (m_sideCycles >= kSideBatchCycles)
+        flushSideCycles();
+}
+
+void EeScheduler::flushSideCycles() noexcept
+{
+    const uint64_t cycles = m_sideCycles;
+    if (cycles == 0u)
+        return;
+    m_sideCycles = 0u;
+    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(cycles);
+    m_runtime.advanceIopEeCycles(cycles);
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
@@ -1806,6 +1821,7 @@ namespace
     // GOW-Port: estado del flanco de la interrupcion del GS (solo se usa en el hilo ejecutor). Se guarda
     // aqui y no en EeScheduler para no cambiar el tamano de la clase.
     uint32_t g_gsIrqLatched = 0u;
+    uint32_t g_gsIrqEventsSeen[2] = {}; // ps2_gs_csr_events::count of SIGNAL / FINISH at the last poll
 }
 
 void EeScheduler::pollGsInterrupt()
@@ -1818,7 +1834,19 @@ void EeScheduler::pollGsInterrupt()
     const uint32_t csr = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
     const uint32_t masked = static_cast<uint32_t>(gs.imr >> 8) & 0x3u;
     const uint32_t active = csr & ~masked;
-    const uint32_t rising = active & ~g_gsIrqLatched;
+    // GOW-Port: a bit set again after the handler acknowledged it but before this poll is a new event even though the
+    // bit looks unchanged since the last poll (see runtime/gs/gs_csr_events.h).
+    uint32_t setAgain = 0u;
+    for (uint32_t bit = 0u; bit < 2u; ++bit)
+    {
+        const uint32_t count = ps2_gs_csr_events::count(bit);
+        if (count != g_gsIrqEventsSeen[bit])
+        {
+            g_gsIrqEventsSeen[bit] = count;
+            setAgain |= 1u << bit;
+        }
+    }
+    const uint32_t rising = (active & ~g_gsIrqLatched) | (active & setAgain);
     g_gsIrqLatched = active;
     if (rising != 0u)
     {

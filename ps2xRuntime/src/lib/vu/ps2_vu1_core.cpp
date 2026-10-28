@@ -17,7 +17,9 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <ps2_log.h>
 #include "runtime/ps2_perf.h"
 
@@ -2388,6 +2390,34 @@ uint64_t VU1Interpreter::hashMicrocode(const uint8_t *code, uint32_t size)
     return hash;
 }
 
+// GOW_VU1_CAPTURA=<carpeta>: guarda cada micromemoria distinta (entrada de generar_vu1). Son datos del juego: no se
+// publican. Called from the exact engine on every code upload and, with the native VU1 on, on the first native miss of
+// each upload, so a capture can be done while playing at full speed and it only keeps the micromemories that miss.
+static void captureMicrocode(const uint8_t *vuCode, uint32_t codeSize)
+{
+    static const char *captureDir = std::getenv("GOW_VU1_CAPTURA");
+    if (captureDir == nullptr)
+        return;
+    static std::mutex mutex;
+    static std::unordered_set<uint64_t> seen; // keeps the disk out of the per-upload path
+    const uint64_t hash = VU1Interpreter::hashMicrocode(vuCode, codeSize);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!seen.insert(hash).second)
+        return;
+    char name[64];
+    std::snprintf(name, sizeof(name), "/vu1_%016llx.bin", static_cast<unsigned long long>(hash));
+    const std::string path = std::string(captureDir) + name;
+    if (std::filesystem::exists(path))
+        return;
+    if (std::FILE *file = std::fopen(path.c_str(), "wb"))
+    {
+        std::fwrite(vuCode, 1, codeSize, file);
+        std::fclose(file);
+        std::fprintf(stderr, "[vu1-captura] new micromemory vu1_%016llx.bin (%zu this session)\n",
+                     static_cast<unsigned long long>(hash), seen.size());
+    }
+}
+
 VU1Interpreter::CompiledProgramFn VU1Interpreter::compiledProgramFor(uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory)
 {
     if (m_unit != Unit::VU1 || !m_directRegisterWrites || memory == nullptr || vuCode != memory->getVU1Code() ||
@@ -2399,24 +2429,7 @@ VU1Interpreter::CompiledProgramFn VU1Interpreter::compiledProgramFor(uint8_t *vu
         m_compiledGeneration = generation;
         // Mantener al día la caché de decodificación (y m_statusUnread) aunque se use el código compilado.
         (void)getDecodedInstructionPairForPc(vuCode, codeSize, memory, 0u);
-        // GOW_VU1_CAPTURA=<carpeta>: guarda cada micromemoria distinta (entrada de generar_vu1). Son datos del
-        // juego: no se publican.
-        static const char *captureDir = std::getenv("GOW_VU1_CAPTURA");
-        if (captureDir != nullptr)
-        {
-            char name[64];
-            std::snprintf(name, sizeof(name), "/vu1_%016llx.bin", static_cast<unsigned long long>(hashMicrocode(vuCode, codeSize)));
-            const std::string path = std::string(captureDir) + name;
-            if (!std::filesystem::exists(path))
-            {
-                std::FILE *file = std::fopen(path.c_str(), "wb");
-                if (file != nullptr)
-                {
-                    std::fwrite(vuCode, 1, codeSize, file);
-                    std::fclose(file);
-                }
-            }
-        }
+        captureMicrocode(vuCode, codeSize);
     }
     return m_compiledEnabled ? g_compiledProgram.load(std::memory_order_acquire) : nullptr;
 }

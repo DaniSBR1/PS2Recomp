@@ -2,7 +2,6 @@
 
 #include <condition_variable>
 #include <cstdio>
-#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -13,6 +12,7 @@ namespace
     {
         GifPathId path = GifPathId::Path1;
         std::vector<uint8_t> data;
+        std::function<void()> call; // pushCall: runs instead of a packet
     };
 
     // Bound on queued bytes: enough for several XGKICK packets of a batch, small enough that the worker never
@@ -25,7 +25,9 @@ namespace
         std::condition_variable work;   // stage waits for packets
         std::condition_variable space;  // producer waits for room
         std::condition_variable idle;   // waitIdle
-        std::deque<Packet> queue;
+        // GOW-Port: vectors, not std::deque: MSVC's deque gives a 32-byte element a block of its own, so every packet
+        // paid an allocation and a free. The two vectors are swapped and keep their capacity.
+        std::vector<Packet> queue;
         std::vector<std::vector<uint8_t>> spare; // recycled buffers (avoid an allocation per packet)
         size_t queuedBytes = 0;
         bool busy = false;
@@ -45,7 +47,7 @@ namespace
     void loop()
     {
         Stage &s = stage();
-        std::deque<Packet> batch;
+        std::vector<Packet> batch;
         for (;;)
         {
             {
@@ -54,6 +56,7 @@ namespace
                 {
                     p.data.clear();
                     s.spare.push_back(std::move(p.data));
+                    p.call = nullptr;
                 }
                 batch.clear();
                 s.busy = false;
@@ -68,7 +71,12 @@ namespace
             }
             s.space.notify_all();
             for (const Packet &p : batch)
-                s.process(p.path, p.data.data(), static_cast<uint32_t>(p.data.size()));
+            {
+                if (p.call)
+                    p.call();
+                else
+                    s.process(p.path, p.data.data(), static_cast<uint32_t>(p.data.size()));
+            }
             if (s.afterBatch)
                 s.afterBatch();
         }
@@ -129,6 +137,19 @@ namespace ps2_gs_stage
         }
         p.data.assign(data, data + size);
         s.queuedBytes += size;
+        const bool wasEmpty = s.queue.empty();
+        s.queue.push_back(std::move(p));
+        lock.unlock();
+        if (wasEmpty)
+            s.work.notify_one();
+    }
+
+    void pushCall(std::function<void()> call)
+    {
+        Stage &s = stage();
+        std::unique_lock<std::mutex> lock(s.mutex);
+        Packet p;
+        p.call = std::move(call);
         const bool wasEmpty = s.queue.empty();
         s.queue.push_back(std::move(p));
         lock.unlock();

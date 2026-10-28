@@ -165,6 +165,7 @@ struct VU1Interpreter::NativeState
     bool enabled = std::getenv("GOW_VU1_NATIVE_OFF") == nullptr;
     unsigned verifyLeft = std::getenv("GOW_VU1N_VERIFY") ? static_cast<unsigned>(std::atoi(std::getenv("GOW_VU1N_VERIFY"))) : 0u;
     bool diag = std::getenv("GOW_VU1N_DIAG") != nullptr;
+    uint64_t capturedGeneration = ~0ull; // GOW_VU1_CAPTURA: code generation whose micromemory was already offered on a miss
     unsigned long long nativePairs = 0, missBlocks = 0, nativeRuns = 0;
     std::unordered_map<uint32_t, unsigned> missPcs, missHits;
     unsigned limit = ~0u, count = 0; // verify bisection: native blocks allowed in this run

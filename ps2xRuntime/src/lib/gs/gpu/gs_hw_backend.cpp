@@ -2403,10 +2403,21 @@ struct GSHwBackend::Impl
             }
         }
 
+        if (glErrorsPerBatch)
+            checkGlError("batch");
+    }
+
+    // GOW-Port: glGetError makes the driver catch up with every call queued so far (NVIDIA's threaded optimisation waits
+    // for its worker thread). After every batch (~1,000 per frame in God of War II) it kept the GS thread busy ~45 % of
+    // the time and capped the first area at ~50 FPS. It is checked once per frame; GOW_GS_HW_GLERRORS=1 checks after
+    // every batch again, to find the one that fails.
+    const bool glErrorsPerBatch = std::getenv("GOW_GS_HW_GLERRORS") != nullptr;
+    void checkGlError(const char *where)
+    {
         static int errorsShown = 0;
         if (errorsShown < 8)
-            if (const GLenum err = g.GetError())
-                std::fprintf(stderr, "[gs-hw] GL error 0x%x after batch %llu\n", err, (unsigned long long)stats.batches), ++errorsShown;
+            if (const GLenum err = gl().GetError())
+                std::fprintf(stderr, "[gs-hw] GL error 0x%x after %s %llu\n", err, where, (unsigned long long)stats.batches), ++errorsShown;
     }
 
     // GOW-Port: GOW_GS_TEXSRC=1 classifies every texture decode (and target readback) by where its data came from, every
@@ -2662,6 +2673,8 @@ PresentationFrame GSHwBackend::Present(const GSPresentationRequest &request)
     if (!d.ensure())
         return frame;
     d.flushPending();
+    if (!d.glErrorsPerBatch)
+        d.checkGlError("the frame's batches, last");
     ++d.presentCount;
     d.dumpAfterSkip = false;
     d.frameBatch = 0;

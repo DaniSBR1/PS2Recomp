@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_backend.h"
+#include "runtime/gs/gs_csr_events.h"
 // GOW-Port: CPU de referencia por defecto; OpenGL/cola seleccionables.
 #include "runtime/gs/gs_threaded_backend.h"
 #include "runtime/gs/gs_shared_present.h"
@@ -1788,7 +1789,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
             lo = (lo & ~mask) | (id & mask);
             m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
-            m_privRegs->csr.fetch_or(0x1);
+            ps2_gs_csr_events::noteSet(m_privRegs->csr.fetch_or(0x1), 0x1u);
         }
         break;
     }
@@ -1802,7 +1803,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             m_backend->Sync(GSSyncReason::Finish);
         }
         if (m_privRegs)
-            m_privRegs->csr.fetch_or(0x2);
+            ps2_gs_csr_events::noteSet(m_privRegs->csr.fetch_or(0x2), 0x2u);
         break;
     }
     case GS_REG_LABEL:
