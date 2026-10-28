@@ -65,7 +65,7 @@ bool GifArbiter::trackPath3Packet(const uint8_t *data, uint32_t sizeBytes)
 
 namespace
 {
-    thread_local bool t_gifArbiterDirect = false; // inside a direct PATH1 call (see submit)
+    thread_local bool t_gifArbiterDirect = false; // inside a direct PATH1/PATH2 call (see submit)
 }
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
@@ -73,11 +73,12 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     if (!data || sizeBytes < 16 || !m_processFn || pathId < GifPathId::Path1 || pathId > GifPathId::Path3)
         return;
 
-    // GOW-Port: every PATH1 packet (XGKICK) is drained right after it is submitted (PS2Memory::submitGifPacket). With
-    // nothing else queued, the drain would process it first anyway (PATH1 has the highest priority), so it goes to the
-    // GS straight from the VU1's buffer: no copy into the queue, no allocation, no sort. What its callback queues is
-    // drained after it, as before.
-    if (pathId == GifPathId::Path1 && m_queue.empty() && !t_gifArbiterDirect)
+    // GOW-Port: every PATH1 packet (XGKICK) and every PATH2 packet (VIF1 DIRECT/DIRECTHL) is drained right after it is
+    // submitted (PS2Memory::submitGifPacket). With nothing else queued, the drain would process it first anyway (it is
+    // alone, so no PATH3 IMAGE can hold a DIRECTHL back), so it goes to the GS straight from the caller's buffer: no
+    // copy into the queue, no allocation, no sort. What its callback queues is drained after it, as before. PATH2 was
+    // ~20 % of the VIF1 thread in God of War II, mostly the heap. PATH3 keeps the queue (its tag cursor, masked FIFO).
+    if ((pathId == GifPathId::Path1 || pathId == GifPathId::Path2) && m_queue.empty() && !t_gifArbiterDirect)
     {
         t_gifArbiterDirect = true;
         m_processFn(pathId, data, sizeBytes);
